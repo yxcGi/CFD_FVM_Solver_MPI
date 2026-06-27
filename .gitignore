@@ -1,0 +1,28 @@
+.cache
+.vscode
+bin
+build
+# first_assignment
+# mesh
+# smallfvm3.0
+lib
+*.dat
+.DS_Store
+
+main
+a.out*
+a.*
+a.cpp
+outputPolyMesh
+
+test
+phi.*
+
+.VSCodeCounter
+
+collect_code.sh
+project_code_for_ai.md
+Geometry_Source_Code.md
+*solution*.dat
+
+
