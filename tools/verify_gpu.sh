@@ -26,6 +26,8 @@ fail() {
 
 # 1. 编译（只编译需要的目标）
 cmake_args=(-S "$root" -B "$build/cmake" -DCMAKE_BUILD_TYPE=Release -DCFD_USE_CUDA=ON)
+# WSL2 中 nvidia-smi 由 Windows 驱动提供，位于 /usr/lib/wsl/lib
+[ -d /usr/lib/wsl/lib ] && export PATH="$PATH:/usr/lib/wsl/lib"
 if command -v nvidia-smi > /dev/null 2>&1; then
     cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' .')
     if [[ "$cap" =~ ^[0-9]+$ ]]; then
