@@ -47,6 +47,9 @@ public:
     // 修正法向量(反向)
     void reverseNormal();
 
+    // 直接设置几何信息（并行分解时由 0 号进程计算好的全局几何分发到各进程）
+    void setGeometry(const Vector<Scalar>& normal, Scalar area, const Vector<Scalar>& center);
+
     // 输出流重载
     friend std::ostream& operator<<(std::ostream& out, const Face& face);
 

@@ -149,6 +149,13 @@ void Face::calculateFaceInfo(const std::vector<Vector<Scalar>>& points)
     // printFaceInfo();
 }
 
+void Face::setGeometry(const Vector<Scalar>& normal, Scalar area, const Vector<Scalar>& center)
+{
+    normal_ = normal;
+    area_ = area;
+    center_ = center;
+}
+
 void Face::reverseNormal()
 {
     normal_ = -normal_;

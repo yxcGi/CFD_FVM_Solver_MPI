@@ -57,7 +57,7 @@ auto grad(
     {
         if (field.getMesh()->getDimension() == Mesh::Dimension::TWO_D)
         {
-            for (ULL i = 0; i < cells.size(); ++i)
+            for (ULL i = 0; i < field.getMesh()->getCellNumber(); ++i)  // 自有单元
             {
                 const Cell& cell = cells[i];
                 // 定义总的phi * S_f
@@ -88,7 +88,7 @@ auto grad(
         }
         else if (field.getMesh()->getDimension() == Mesh::Dimension::THREE_D)
         {
-            for (ULL i = 0; i < cells.size(); ++i)
+            for (ULL i = 0; i < field.getMesh()->getCellNumber(); ++i)  // 自有单元
             {
                 const Cell& cell = cells[i];
                 decltype(Tp() * Vector<Scalar>()) total_Phi_Sf{};

@@ -30,7 +30,7 @@ auto divergence(const FaceField<Tp>& field) -> CellField<decltype(Tp()& Vector<S
 
 
     if (field.getMesh()->getDimension() == Mesh::Dimension::TWO_D) {
-        for (ULL i = 0; i < cells.size(); ++i) {
+        for (ULL i = 0; i < field.getMesh()->getCellNumber(); ++i) {  // 自有单元
             const Cell& cell = cells[i];
             DivType div{};
             for (ULL j : cell.getFaceIndexes()) {
@@ -55,7 +55,7 @@ auto divergence(const FaceField<Tp>& field) -> CellField<decltype(Tp()& Vector<S
         }
     }
     else if (field.getMesh()->getDimension() == Mesh::Dimension::THREE_D) {
-        for (ULL i = 0; i < cells.size(); ++i) {
+        for (ULL i = 0; i < field.getMesh()->getCellNumber(); ++i) {  // 自有单元
             const Cell& cell = cells[i];
             DivType div{};
             for (ULL j : cell.getFaceIndexes()) {

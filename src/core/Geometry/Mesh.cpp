@@ -7,6 +7,10 @@
 #include <sstream>
 #include <map>
 #include <cassert>
+#include <numeric>
+#include <cstring>
+#include <type_traits>
+#include "Parallel/Decomposition.h"
 // #include <thread>
 // #include "Field.hpp"
 
@@ -22,8 +26,81 @@ Mesh::Mesh(const std::string& path)
     , meshPath_(path)
     , dimension_(Mesh::Dimension::THREE_D)
 {
-    readMesh(path);
+    if (!par::isParallel())
+    {
+        // 单进程：与原串行实现完全相同
+        readMesh(path);
+        setupSerialParallelInfo();
+        return;
+    }
+
+    // 多进程：0 号进程读取完整网格并分解，其余进程接收各自的子网格
+    constexpr int MESH_TAG = 7100;
+    std::unique_ptr<Mesh> global;
+    std::vector<char> myPack;
+    std::vector<ULL> cellPositions;
+    std::vector<ULL> fluxFacePositions;
+
+    if (par::isMaster())
+    {
+        global.reset(new Mesh(path, SerialReadTag{}));
+        std::vector<std::vector<char>> packs =
+            decompose(*global, par::size(), cellPositions, fluxFacePositions);
+        for (int p = 1; p < par::size(); ++p)
+        {
+            par::sendBytes(packs[p], p, MESH_TAG);
+            std::vector<char>().swap(packs[p]);
+        }
+        myPack = std::move(packs[0]);
+    }
+    else
+    {
+        myPack = par::recvBytes(0, MESH_TAG);
+    }
+
+    buildLocalMesh(myPack);
+
+    // 通量面数：内部面中 owner 为自有单元的面 + 全部边界面
+    ULL nFluxFaces = boundaryFaceIndexes_.size();
+    for (ULL faceId : internalFaceIndexes_)
+    {
+        if (faces_[faceId].getOwnerIndex() < nOwnedCells_)
+        {
+            ++nFluxFaces;
+        }
+    }
+    const ULL nGlobalFluxFaces = par::allReduceSum(nFluxFaces);
+
+    cellOrdering_.setup(nOwnedCells_, nGlobalCells_, std::move(cellPositions));
+    fluxFaceOrdering_.setup(nFluxFaces, nGlobalFluxFaces, std::move(fluxFacePositions));
+
+    if (par::isMaster())
+    {
+        globalMesh_ = std::move(global);
+    }
+
+    // 输出分解信息
+    const ULL nGhost = getGhostCellNumber();
+    const ULL minCells = static_cast<ULL>(-par::allReduceMax(-static_cast<double>(nOwnedCells_)));
+    const ULL maxCells = static_cast<ULL>(par::allReduceMax(static_cast<double>(nOwnedCells_)));
+    const ULL totalGhost = par::allReduceSum(nGhost);
+    std::cout << "Mesh decomposed into " << par::size() << " subdomains (RCB): "
+              << "cells per process min/max = " << minCells << "/" << maxCells
+              << ", total ghost cells = " << totalGhost << std::endl;
 }
+
+Mesh::Mesh(const std::string& path, SerialReadTag)
+    : isValid_(false)
+    , meshPath_(path)
+    , dimension_(Mesh::Dimension::THREE_D)
+{
+    readMesh(path);
+    setupSerialParallelInfo();
+}
+
+Mesh::Mesh(Mesh&&) noexcept = default;
+Mesh& Mesh::operator=(Mesh&&) noexcept = default;
+Mesh::~Mesh() = default;
 
 void Mesh::readMesh(const std::string& path)
 {
@@ -47,6 +124,16 @@ void Mesh::readMesh(const std::string& path)
 
 void Mesh::writeMeshToFile(const std::string& path) const
 {
+    if (distributed_)
+    {
+        // 并行时由 0 号进程写出完整网格
+        if (par::isMaster())
+        {
+            globalMesh_->writeMeshToFile(path);
+        }
+        return;
+    }
+
     if (!isValid_)
     {
         std::cerr << "Error: Mesh is invalid, cannot write to file." << std::endl;
@@ -118,7 +205,7 @@ ULL Mesh::getCellNumber() const
         std::cerr << "Error: Mesh is invalid, cannot return cell number." << std::endl;
         throw std::runtime_error("Invalid mesh cell number error");
     }
-    return static_cast<ULL>(cells_.size());
+    return nOwnedCells_;
 }
 
 ULL Mesh::getFaceNumber() const
@@ -199,6 +286,14 @@ const std::unordered_map<std::string, BoundaryPatch>& Mesh::getBoundaryPatches()
 void Mesh::getBoundaryMessage
 () const
 {
+    if (distributed_)
+    {
+        if (par::isMaster())
+        {
+            globalMesh_->getBoundaryMessage();
+        }
+        return;
+    }
     if (!isValid_)
     {
         std::cerr << "Mesh::getBoundaryNames() Error: Mesh is invalid, cannot return boundary names.";
@@ -219,9 +314,9 @@ ULL Mesh::getNumber(field::FieldType type) const
     }
 
     if (type == field::FieldType::CELL_FIELD)
-
     {
-        return getCellNumber();
+        // 单元场存储自有单元与幽灵单元
+        return getLocalCellNumber();
     }
     else if (type == field::FieldType::FACE_FIELD)
     {
@@ -372,6 +467,7 @@ void Mesh::readBoundaryPatch(const std::string& boundaryPath)
         iss >> ignoreStr >> startFace;
 
         // 添加至boundaryPatch_ map中
+        patchOrder_.push_back(boundaryName);
         BoundaryPatch patch(boundaryName, nFaces, startFace, type);
         boundaryPatches_.emplace(boundaryName, std::move(patch));
     }
@@ -1050,4 +1146,580 @@ void Mesh::calculateMeshInfo()
         //     std::cout << "no" << std::endl;
         // }
     }
+}
+
+
+
+/* =============================================================== */
+/*                         并行：区域分解                           */
+/* =============================================================== */
+
+namespace
+{
+    using ULL = unsigned long long;
+    using LL = long long;
+
+    // 简单的二进制打包/解包工具（仅用于可平凡拷贝的类型）
+    class Packer
+    {
+    public:
+        template<typename T>
+        void put(const T& value)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            const char* p = reinterpret_cast<const char*>(&value);
+            buffer.insert(buffer.end(), p, p + sizeof(T));
+        }
+
+        template<typename T>
+        void putVector(const std::vector<T>& values)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            put<ULL>(values.size());
+            const char* p = reinterpret_cast<const char*>(values.data());
+            buffer.insert(buffer.end(), p, p + values.size() * sizeof(T));
+        }
+
+        void putString(const std::string& value)
+        {
+            put<ULL>(value.size());
+            buffer.insert(buffer.end(), value.begin(), value.end());
+        }
+
+        std::vector<char> buffer;
+    };
+
+    class Unpacker
+    {
+    public:
+        explicit Unpacker(const std::vector<char>& buffer) : buffer_(buffer) {}
+
+        template<typename T>
+        T get()
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            check(sizeof(T));
+            T value;
+            std::memcpy(&value, buffer_.data() + pos_, sizeof(T));
+            pos_ += sizeof(T);
+            return value;
+        }
+
+        template<typename T>
+        std::vector<T> getVector()
+        {
+            const ULL n = get<ULL>();
+            check(n * sizeof(T));
+            std::vector<T> values(n);
+            std::memcpy(values.data(), buffer_.data() + pos_, n * sizeof(T));
+            pos_ += n * sizeof(T);
+            return values;
+        }
+
+        std::string getString()
+        {
+            const ULL n = get<ULL>();
+            check(n);
+            std::string value(buffer_.data() + pos_, buffer_.data() + pos_ + n);
+            pos_ += n;
+            return value;
+        }
+
+    private:
+        void check(std::size_t n) const
+        {
+            if (pos_ + n > buffer_.size())
+            {
+                throw std::runtime_error("Mesh: corrupted decomposition data");
+            }
+        }
+
+        const std::vector<char>& buffer_;
+        std::size_t pos_ = 0;
+    };
+
+    void putPoint(std::vector<double>& out, const Vector<double>& p)
+    {
+        out.push_back(p.x());
+        out.push_back(p.y());
+        out.push_back(p.z());
+    }
+
+    Vector<double> getPoint(const std::vector<double>& in, ULL i)
+    {
+        return Vector<double>(in[3 * i], in[3 * i + 1], in[3 * i + 2]);
+    }
+}
+
+void Mesh::setupSerialParallelInfo()
+{
+    distributed_ = false;
+    nOwnedCells_ = cells_.size();
+    nGlobalCells_ = cells_.size();
+    nGlobalFaces_ = faces_.size();
+    nGlobalPoints_ = points_.size();
+    globalCellIds_.clear();
+    globalFaceIds_.clear();
+    halo_ = par::HaloExchange();
+    cellOrdering_.setupSerial(nOwnedCells_);
+    fluxFaceOrdering_.setupSerial(internalFaceIndexes_.size() + boundaryFaceIndexes_.size());
+}
+
+std::vector<std::vector<char>> Mesh::decompose(
+    const Mesh& global,
+    int nProcs,
+    std::vector<ULL>& cellPositions,
+    std::vector<ULL>& fluxFacePositions)
+{
+    const std::vector<Face>& gFaces = global.faces_;
+    const std::vector<Cell>& gCells = global.cells_;
+    const ULL nCells = gCells.size();
+    const ULL nFaces = gFaces.size();
+    const ULL nPoints = global.points_.size();
+
+    // 1. 按单元中心做 RCB 分解
+    std::vector<Vector<double>> centers(nCells);
+    for (ULL c = 0; c < nCells; ++c)
+    {
+        centers[c] = gCells[c].getCenter();
+    }
+    const std::vector<int> part = par::decomposeRCB(centers, nProcs);
+
+    // 2. 各进程自有单元（全局编号升序）
+    std::vector<std::vector<ULL>> owned(nProcs);
+    for (ULL c = 0; c < nCells; ++c)
+    {
+        owned[part[c]].push_back(c);
+    }
+
+    // 3. 各进程的局部面（与自有单元相邻的面，全局编号升序）与幽灵单元
+    std::vector<std::vector<ULL>> localFaces(nProcs);
+    std::vector<std::vector<ULL>> ghosts(nProcs);
+    for (ULL f = 0; f < nFaces; ++f)
+    {
+        const ULL o = gFaces[f].getOwnerIndex();
+        const LL n = gFaces[f].getNeighborIndex();
+        const int po = part[o];
+        localFaces[po].push_back(f);
+        if (n >= 0)
+        {
+            const int pn = part[static_cast<ULL>(n)];
+            if (pn != po)
+            {
+                localFaces[pn].push_back(f);
+                ghosts[po].push_back(static_cast<ULL>(n));
+                ghosts[pn].push_back(o);
+            }
+        }
+    }
+    for (int p = 0; p < nProcs; ++p)
+    {
+        std::sort(ghosts[p].begin(), ghosts[p].end());
+        ghosts[p].erase(std::unique(ghosts[p].begin(), ghosts[p].end()), ghosts[p].end());
+    }
+
+    // 4. halo 发送关系：ghostsFrom[q][r] = 进程 q 从进程 r 接收的幽灵单元（全局编号升序）
+    std::vector<std::vector<std::vector<ULL>>> ghostsFrom(nProcs, std::vector<std::vector<ULL>>(nProcs));
+    for (int q = 0; q < nProcs; ++q)
+    {
+        for (ULL g : ghosts[q])
+        {
+            ghostsFrom[q][part[g]].push_back(g);
+        }
+    }
+
+    // 5. 结果收集顺序：各进程自有单元依次拼接后的全局位置
+    cellPositions.clear();
+    cellPositions.reserve(nCells);
+    for (int p = 0; p < nProcs; ++p)
+    {
+        cellPositions.insert(cellPositions.end(), owned[p].begin(), owned[p].end());
+    }
+
+    // 6. 通量面顺序：串行程序先遍历内部面、再遍历（非 empty）边界面
+    std::vector<LL> fluxSequence(nFaces, -1);
+    {
+        LL pos = 0;
+        for (ULL f : global.internalFaceIndexes_)
+        {
+            fluxSequence[f] = pos++;
+        }
+        for (ULL f : global.boundaryFaceIndexes_)
+        {
+            fluxSequence[f] = pos++;
+        }
+    }
+    fluxFacePositions.clear();
+    for (int p = 0; p < nProcs; ++p)
+    {
+        // 与局部循环顺序一致：先内部面（owner 属于本进程），后边界面
+        for (ULL f : localFaces[p])
+        {
+            if (gFaces[f].getNeighborIndex() >= 0 && part[gFaces[f].getOwnerIndex()] == p)
+            {
+                fluxFacePositions.push_back(static_cast<ULL>(fluxSequence[f]));
+            }
+        }
+        for (ULL f : localFaces[p])
+        {
+            if (gFaces[f].getNeighborIndex() < 0 && fluxSequence[f] >= 0)
+            {
+                fluxFacePositions.push_back(static_cast<ULL>(fluxSequence[f]));
+            }
+        }
+    }
+
+    // 7. 为每个进程打包局部网格
+    std::vector<LL> cellG2L(nCells, -1);
+    std::vector<LL> pointG2L(nPoints, -1);
+    std::vector<std::vector<char>> packs(nProcs);
+
+    for (int p = 0; p < nProcs; ++p)
+    {
+        // 局部单元编号：自有单元在前，幽灵单元在后，各自按全局编号升序
+        std::vector<ULL> localCells = owned[p];
+        localCells.insert(localCells.end(), ghosts[p].begin(), ghosts[p].end());
+        for (ULL i = 0; i < localCells.size(); ++i)
+        {
+            cellG2L[localCells[i]] = static_cast<LL>(i);
+        }
+
+        // 局部点：局部面与局部单元用到的点
+        std::vector<ULL> localPoints;
+        for (ULL f : localFaces[p])
+        {
+            const auto& pts = gFaces[f].getPointIndexes();
+            localPoints.insert(localPoints.end(), pts.begin(), pts.end());
+        }
+        for (ULL c : localCells)
+        {
+            const auto& pts = gCells[c].getPointIndexes();
+            localPoints.insert(localPoints.end(), pts.begin(), pts.end());
+        }
+        std::sort(localPoints.begin(), localPoints.end());
+        localPoints.erase(std::unique(localPoints.begin(), localPoints.end()), localPoints.end());
+        for (ULL i = 0; i < localPoints.size(); ++i)
+        {
+            pointG2L[localPoints[i]] = static_cast<LL>(i);
+        }
+
+        Packer pk;
+        pk.put<int>(static_cast<int>(global.dimension_));
+        pk.put<int>(static_cast<int>(global.meshShape_));
+        pk.put<ULL>(nCells);
+        pk.put<ULL>(nFaces);
+        pk.put<ULL>(nPoints);
+        pk.put<ULL>(owned[p].size());
+        pk.putVector(localCells);
+        pk.putVector(localFaces[p]);
+
+        // 点坐标
+        std::vector<double> pointCoords;
+        pointCoords.reserve(3 * localPoints.size());
+        for (ULL gp : localPoints)
+        {
+            putPoint(pointCoords, global.points_[gp]);
+        }
+        pk.putVector(pointCoords);
+
+        // 面：拓扑 + 几何
+        std::vector<ULL> facePointOffsets{ 0 };
+        std::vector<ULL> facePoints;
+        std::vector<ULL> faceOwners;
+        std::vector<LL> faceNeighbours;
+        std::vector<double> faceNormals;
+        std::vector<double> faceAreas;
+        std::vector<double> faceCenters;
+        for (ULL f : localFaces[p])
+        {
+            const Face& face = gFaces[f];
+            for (ULL gp : face.getPointIndexes())
+            {
+                facePoints.push_back(static_cast<ULL>(pointG2L[gp]));
+            }
+            facePointOffsets.push_back(facePoints.size());
+            faceOwners.push_back(static_cast<ULL>(cellG2L[face.getOwnerIndex()]));
+            const LL n = face.getNeighborIndex();
+            faceNeighbours.push_back(n >= 0 ? cellG2L[static_cast<ULL>(n)] : -1);
+            putPoint(faceNormals, face.getNormal());
+            faceAreas.push_back(face.getArea());
+            putPoint(faceCenters, face.getCenter());
+        }
+        pk.putVector(facePointOffsets);
+        pk.putVector(facePoints);
+        pk.putVector(faceOwners);
+        pk.putVector(faceNeighbours);
+        pk.putVector(faceNormals);
+        pk.putVector(faceAreas);
+        pk.putVector(faceCenters);
+
+        // 单元几何
+        std::vector<ULL> cellPointOffsets{ 0 };
+        std::vector<ULL> cellPoints;
+        std::vector<double> cellVolumes;
+        std::vector<double> cellCenters;
+        for (ULL c : localCells)
+        {
+            const Cell& cell = gCells[c];
+            for (ULL gp : cell.getPointIndexes())
+            {
+                cellPoints.push_back(static_cast<ULL>(pointG2L[gp]));
+            }
+            cellPointOffsets.push_back(cellPoints.size());
+            cellVolumes.push_back(cell.getVolume());
+            putPoint(cellCenters, cell.getCenter());
+        }
+        pk.putVector(cellPointOffsets);
+        pk.putVector(cellPoints);
+        pk.putVector(cellVolumes);
+        pk.putVector(cellCenters);
+
+        // 边界 patch（按文件顺序，局部起止面）
+        const auto localFaceBound = [&](ULL globalFace) {
+            return static_cast<ULL>(
+                std::lower_bound(localFaces[p].begin(), localFaces[p].end(), globalFace) -
+                localFaces[p].begin());
+        };
+        pk.put<ULL>(global.patchOrder_.size());
+        for (const std::string& name : global.patchOrder_)
+        {
+            const BoundaryPatch& patch = global.boundaryPatches_.at(name);
+            const ULL begin = localFaceBound(patch.getStartFace());
+            const ULL end = localFaceBound(patch.getStartFace() + patch.getNFace());
+            pk.putString(name);
+            pk.put<int>(static_cast<int>(patch.getType()));
+            pk.put<ULL>(begin);
+            pk.put<ULL>(end - begin);
+        }
+        pk.put<ULL>(localFaceBound(global.emptyFaceIndexesPair_.first));
+        pk.put<ULL>(localFaceBound(global.emptyFaceIndexesPair_.second));
+
+        // halo 交换列表（局部编号）
+        std::vector<int> neighbours;
+        for (int r = 0; r < nProcs; ++r)
+        {
+            if (r != p && (!ghostsFrom[p][r].empty() || !ghostsFrom[r][p].empty()))
+            {
+                neighbours.push_back(r);
+            }
+        }
+        pk.putVector(neighbours);
+        for (int r : neighbours)
+        {
+            std::vector<ULL> sendList;
+            for (ULL g : ghostsFrom[r][p])
+            {
+                sendList.push_back(static_cast<ULL>(cellG2L[g]));
+            }
+            std::vector<ULL> recvList;
+            for (ULL g : ghostsFrom[p][r])
+            {
+                recvList.push_back(static_cast<ULL>(cellG2L[g]));
+            }
+            pk.putVector(sendList);
+            pk.putVector(recvList);
+        }
+
+        packs[p] = std::move(pk.buffer);
+
+        // 复位映射
+        for (ULL c : localCells)
+        {
+            cellG2L[c] = -1;
+        }
+        for (ULL gp : localPoints)
+        {
+            pointG2L[gp] = -1;
+        }
+    }
+
+    return packs;
+}
+
+void Mesh::buildLocalMesh(const std::vector<char>& pack)
+{
+    Unpacker up(pack);
+
+    distributed_ = true;
+    dimension_ = static_cast<Dimension>(up.get<int>());
+    meshShape_ = static_cast<MeshShape>(up.get<int>());
+    nGlobalCells_ = up.get<ULL>();
+    nGlobalFaces_ = up.get<ULL>();
+    nGlobalPoints_ = up.get<ULL>();
+    nOwnedCells_ = up.get<ULL>();
+    globalCellIds_ = up.getVector<ULL>();
+    globalFaceIds_ = up.getVector<ULL>();
+
+    // 点
+    const std::vector<double> pointCoords = up.getVector<double>();
+    points_.clear();
+    points_.reserve(pointCoords.size() / 3);
+    for (ULL i = 0; i < pointCoords.size() / 3; ++i)
+    {
+        points_.push_back(getPoint(pointCoords, i));
+    }
+
+    // 面
+    const std::vector<ULL> facePointOffsets = up.getVector<ULL>();
+    const std::vector<ULL> facePoints = up.getVector<ULL>();
+    const std::vector<ULL> faceOwners = up.getVector<ULL>();
+    const std::vector<LL> faceNeighbours = up.getVector<LL>();
+    const std::vector<double> faceNormals = up.getVector<double>();
+    const std::vector<double> faceAreas = up.getVector<double>();
+    const std::vector<double> faceCenters = up.getVector<double>();
+    faces_.clear();
+    faces_.reserve(faceOwners.size());
+    for (ULL f = 0; f < faceOwners.size(); ++f)
+    {
+        std::vector<ULL> pts(facePoints.begin() + facePointOffsets[f],
+                             facePoints.begin() + facePointOffsets[f + 1]);
+        Face face(pts, faceOwners[f], faceNeighbours[f]);
+        face.setGeometry(getPoint(faceNormals, f), faceAreas[f], getPoint(faceCenters, f));
+        faces_.emplace_back(std::move(face));
+    }
+
+    // 单元几何
+    const std::vector<ULL> cellPointOffsets = up.getVector<ULL>();
+    const std::vector<ULL> cellPoints = up.getVector<ULL>();
+    const std::vector<double> cellVolumes = up.getVector<double>();
+    const std::vector<double> cellCenters = up.getVector<double>();
+
+    // 边界 patch：按与串行相同的顺序插入，保证 unordered_map 遍历顺序一致
+    boundaryPatches_.clear();
+    patchOrder_.clear();
+    const ULL nPatches = up.get<ULL>();
+    for (ULL i = 0; i < nPatches; ++i)
+    {
+        const std::string name = up.getString();
+        const auto type = static_cast<BoundaryPatch::BoundaryType>(up.get<int>());
+        const ULL start = up.get<ULL>();
+        const ULL n = up.get<ULL>();
+        patchOrder_.push_back(name);
+        boundaryPatches_.emplace(name, BoundaryPatch(name, n, start, type));
+    }
+    const ULL emptyFirst = up.get<ULL>();
+    const ULL emptySecond = up.get<ULL>();
+    emptyFaceIndexesPair_ = std::make_pair(emptyFirst, emptySecond);
+
+    // 由局部面构造单元拓扑、内部面/边界面列表（与串行相同的算法）
+    buildCellsFromFaces();
+    const ULL nLocalCells = globalCellIds_.size();
+    if (cells_.size() != nLocalCells)
+    {
+        cells_.resize(nLocalCells);
+    }
+    for (ULL c = 0; c < nLocalCells; ++c)
+    {
+        std::vector<ULL> pts(cellPoints.begin() + cellPointOffsets[c],
+                             cellPoints.begin() + cellPointOffsets[c + 1]);
+        cells_[c].setGeometry(cellVolumes[c], getPoint(cellCenters, c), std::move(pts));
+    }
+
+    // halo
+    std::vector<int> neighbours = up.getVector<int>();
+    std::vector<std::vector<ULL>> sendLists;
+    std::vector<std::vector<ULL>> recvLists;
+    for (std::size_t i = 0; i < neighbours.size(); ++i)
+    {
+        sendLists.push_back(up.getVector<ULL>());
+        recvLists.push_back(up.getVector<ULL>());
+    }
+    halo_.setup(std::move(neighbours), std::move(sendLists), std::move(recvLists));
+
+    isValid_ = true;
+}
+
+/* ---------------- 并行查询接口 ---------------- */
+
+ULL Mesh::getLocalCellNumber() const
+{
+    return static_cast<ULL>(cells_.size());
+}
+
+ULL Mesh::getGhostCellNumber() const
+{
+    return static_cast<ULL>(cells_.size()) - nOwnedCells_;
+}
+
+ULL Mesh::getGlobalCellNumber() const
+{
+    return nGlobalCells_;
+}
+
+ULL Mesh::getGlobalFaceNumber() const
+{
+    return nGlobalFaces_;
+}
+
+ULL Mesh::getGlobalPointNumber() const
+{
+    return nGlobalPoints_;
+}
+
+bool Mesh::isDistributed() const
+{
+    return distributed_;
+}
+
+ULL Mesh::getGlobalCellIndex(ULL localCell) const
+{
+    return distributed_ ? globalCellIds_[localCell] : localCell;
+}
+
+ULL Mesh::getGlobalFaceIndex(ULL localFace) const
+{
+    return distributed_ ? globalFaceIds_[localFace] : localFace;
+}
+
+LL Mesh::findLocalCell(ULL globalCell, bool includeGhost) const
+{
+    if (!distributed_)
+    {
+        return globalCell < cells_.size() ? static_cast<LL>(globalCell) : -1;
+    }
+    // 自有单元、幽灵单元各自按全局编号升序存放
+    const auto search = [&](ULL first, ULL last) -> LL {
+        const auto begin = globalCellIds_.begin() + static_cast<std::ptrdiff_t>(first);
+        const auto end = globalCellIds_.begin() + static_cast<std::ptrdiff_t>(last);
+        const auto it = std::lower_bound(begin, end, globalCell);
+        if (it != end && *it == globalCell)
+        {
+            return static_cast<LL>(it - globalCellIds_.begin());
+        }
+        return -1;
+    };
+    const LL owned = search(0, nOwnedCells_);
+    if (owned >= 0 || !includeGhost)
+    {
+        return owned;
+    }
+    return search(nOwnedCells_, globalCellIds_.size());
+}
+
+const par::HaloExchange& Mesh::getHalo() const
+{
+    return halo_;
+}
+
+const par::GlobalOrdering& Mesh::getCellOrdering() const
+{
+    return cellOrdering_;
+}
+
+const par::GlobalOrdering& Mesh::getFluxFaceOrdering() const
+{
+    return fluxFaceOrdering_;
+}
+
+const Mesh& Mesh::getGlobalMesh() const
+{
+    if (!distributed_)
+    {
+        return *this;
+    }
+    if (!globalMesh_)
+    {
+        throw std::runtime_error("Mesh::getGlobalMesh(): the global mesh is only available on the master process");
+    }
+    return *globalMesh_;
 }

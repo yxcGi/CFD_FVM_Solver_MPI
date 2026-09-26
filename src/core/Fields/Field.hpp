@@ -327,6 +327,10 @@ inline void Field<Tp>::cellToFace(interpolation::Scheme scheme)
         throw std::runtime_error("Boundary condition is not valid!");
     }
 
+    // 并行：先更新幽灵单元的值（内部面插值需要相邻进程的单元值）
+    Mesh* haloMesh = this->getMesh();
+    haloMesh->getHalo().exchange(cellField_.getData());
+
     // 先利用本时间步的面场计算梯度
     cellGradientField_ = grad(gradientMethod_);
 
@@ -421,6 +425,8 @@ inline void Field<Tp>::cellToFace(interpolation::Scheme scheme)
     }
     // 利用新的面值记录计算本时间步的梯度，用于下一时间步的边界面值计算
     cellGradientField_ = grad(gradientMethod_);
+    // 并行：更新幽灵单元的梯度（离散算子在进程间的面上需要相邻单元梯度）
+    haloMesh->getHalo().exchange(cellGradientField_.getData());
 }
 
 template<typename Tp>
@@ -559,7 +565,15 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
 {
     // 私有接口，公有接口调用输出时已经判断过Field是否有效。
 
-    Mesh* mesh = this->getMesh();
+    // 并行：各进程的自有单元值收集到 0 号进程（按全局单元编号排列），
+    // 由 0 号进程使用完整网格写出，与串行输出的文件完全一致。
+    const std::vector<Tp> cellValues =
+        this->getMesh()->getCellOrdering().gatherToMaster(this->cellField_.getData());
+    if (!par::isMaster())
+    {
+        return;
+    }
+    const Mesh* mesh = &this->getMesh()->getGlobalMesh();
 
     if (dim == Mesh::Dimension::TWO_D)  // 二维
     {
@@ -578,7 +592,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
             ofs << R"(VARIABLES="X","Y",")" << name_ << "\"\n";
             ofs << "ZONE T=\"" << name_ << "\",N=" << (mesh->getPointNumber()) << ",E=" << mesh->getCellNumber();   // 进入分支接着输出
 
-            if (this->getMesh()->getMeshShape() ==
+            if (mesh->getMeshShape() ==
                 Mesh::MeshShape::TRIANGLE)      // 二维三角形网格  标量
             {
                 ofs << ",ZONETYPE=FETRIANGLE\n";
@@ -600,7 +614,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                 // 输出所有单元中心的标量值
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i] << "\n";
+                    ofs << cellValues[i] << "\n";
                 }
 
                 // 输出三角形连接表
@@ -637,7 +651,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                     ofs << "\n";
                 }
             }
-            else if (this->getMesh()->getMeshShape() ==
+            else if (mesh->getMeshShape() ==
                 Mesh::MeshShape::QUADRILATERAL) // 二维四边形网格  标量
             {
                 ofs << ",ZONETYPE=FEQUADRILATERAL\n";
@@ -656,7 +670,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                 // 输出所有单元的场值
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i] << "\n";
+                    ofs << cellValues[i] << "\n";
                 }
                 // 每个二维单元由哪几个点构成
                 for (const Cell& cell : mesh->getCells())
@@ -685,7 +699,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
             ofs << R"(VARIABLES="X","Y",")" << name_ << "_U\",\"" << name_ << "_V\"\n";
             ofs << "ZONE T=\"" << name_ << "\",N=" << mesh->getPointNumber() << ",E=" << mesh->getCellNumber();
 
-            if (this->getMesh()->getMeshShape() ==
+            if (mesh->getMeshShape() ==
                 Mesh::MeshShape::TRIANGLE)      // 二维三角形网格  矢量
             {
                 ofs << ",ZONETYPE=FETRIANGLE\n";
@@ -707,13 +721,13 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                 // 输出所有单元中心的 U 分量
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i].x() << "\n";
+                    ofs << cellValues[i].x() << "\n";
                 }
 
                 // 输出所有单元中心的 V 分量
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i].y() << "\n";
+                    ofs << cellValues[i].y() << "\n";
                 }
 
                 // 输出三角形单元连接表
@@ -751,7 +765,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                     ofs << "\n";
                 }
             }
-            else if (this->getMesh()->getMeshShape() ==
+            else if (mesh->getMeshShape() ==
                 Mesh::MeshShape::QUADRILATERAL) // 二维四边形网格  矢量
             {
                 ofs << ",ZONETYPE=FEQUADRILATERAL\n";
@@ -770,11 +784,11 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
                 // 输出所有单元的场值(u, v)
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i].x() << "\n";
+                    ofs << cellValues[i].x() << "\n";
                 }
                 for (ULL i = 0; i < mesh->getCellNumber(); ++i)
                 {
-                    ofs << this->cellField_[i].y() << "\n";
+                    ofs << cellValues[i].y() << "\n";
                 }
 
                 // 输出每个单元的点顺序
@@ -896,7 +910,7 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
             // 输出单元中心标量值
             for (ULL i = 0; i < mesh->getCellNumber(); ++i)
             {
-                ofs << this->cellField_[i] << "\n";
+                ofs << cellValues[i] << "\n";
             }
 
             // 输出单元连接表
@@ -925,19 +939,19 @@ inline void Field<Tp>::writToTecplot(const std::string& fileName, Mesh::Dimensio
             // 输出单元中心 U 分量
             for (ULL i = 0; i < mesh->getCellNumber(); ++i)
             {
-                ofs << this->cellField_[i].x() << "\n";
+                ofs << cellValues[i].x() << "\n";
             }
 
             // 输出单元中心 V 分量
             for (ULL i = 0; i < mesh->getCellNumber(); ++i)
             {
-                ofs << this->cellField_[i].y() << "\n";
+                ofs << cellValues[i].y() << "\n";
             }
 
             // 输出单元中心 W 分量
             for (ULL i = 0; i < mesh->getCellNumber(); ++i)
             {
-                ofs << this->cellField_[i].z() << "\n";
+                ofs << cellValues[i].z() << "\n";
             }
 
             // 输出单元连接表
@@ -967,7 +981,7 @@ inline auto Field<Tp>::grad(GradientMethod method) -> CellField<decltype(Tp()* V
     {
         if (getMesh()->getDimension() == Mesh::Dimension::TWO_D)
         {
-            for (ULL i = 0; i < cells.size(); ++i)  // 计算每个单元的梯度并赋值
+            for (ULL i = 0; i < getMesh()->getCellNumber(); ++i)  // 计算每个（自有）单元的梯度并赋值
             {
                 const Cell& cell = cells[i];
                 // 获取当前单元各个面的id
@@ -1000,7 +1014,7 @@ inline auto Field<Tp>::grad(GradientMethod method) -> CellField<decltype(Tp()* V
         }
         else if (getMesh()->getDimension() == Mesh::Dimension::THREE_D)
         {
-            for (ULL i = 0; i < cells.size(); ++i)  // 计算每个单元的梯度并赋值
+            for (ULL i = 0; i < getMesh()->getCellNumber(); ++i)  // 计算每个（自有）单元的梯度并赋值
             {
                 const Cell& cell = cells[i];
                 // 获取当前单元各个面的id

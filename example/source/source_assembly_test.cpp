@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include <iostream>
 
 #include "Field.hpp"
@@ -7,8 +8,11 @@
 #include "Laplacian.hpp"
 
 
-int main()
+int main(int argc, char** argv)
 {
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
     using Scalar = double;
     // 源项矩阵装配测试
     Mesh mesh("tempFile/OpenFOAM_tutorials/cavity/constant/polyMesh");

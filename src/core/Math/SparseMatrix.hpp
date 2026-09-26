@@ -5,6 +5,7 @@
 
 #include <vector>
 #include "Mesh.h"
+#include <algorithm>
 #include <queue>
 #include "Field.hpp"
 #include "DivType.h"
@@ -51,6 +52,13 @@ namespace fvm
 /**
  * @brief 采用CSR方法存储稀疏矩阵，仅为方阵
  * @tparam Tp 一般为double，int 不会是Vector，此类型为phi的类型和b的向量的类型，矩阵元素为Scalar
+ *
+ * 并行（分布式网格）时：
+ *  - 矩阵只保存本进程自有单元对应的行（size() 为自有单元数）；
+ *  - 列索引为局部单元编号，可指向幽灵单元（进程间耦合）；
+ *  - 每行的列按"全局"单元编号升序排列，与串行矩阵的列顺序一致；
+ *  - 对幽灵单元所在行的写入（离散算子遍历进程间的面时产生）会被忽略，
+ *    该行由相邻进程负责装配，因此离散算子无需区分进程间的面。
  */
 template <typename Tp>
 class SparseMatrix
@@ -98,8 +106,12 @@ public:
 
     // 获取网格
     Mesh* getMesh() const;
-    // 获取size
+    // 获取size（行数；并行时为自有单元数）
     ULL size() const;
+    // 列数（并行时为自有 + 幽灵单元数）
+    ULL colSize() const;
+    // 是否为幽灵行（写入会被忽略）
+    bool isGhostRow(ULL i) const;
 
     // 获取矩阵元素，行首索引，列索引
     const std::vector<Scalar>& getValues() const;
@@ -139,7 +151,9 @@ private:
     std::vector<Scalar> values_;        // 存储数据（行优先），大小为矩阵非0元素个数
     std::vector<ULL> colIndexs_;     // 每个元素列索引, 与values一一对应
     std::vector<ULL> rowPointer_;   // 行指针，每一行起始元素的索引，大小为矩阵行数
-    ULL size_;                      // 矩阵大小
+    ULL size_{ 0 };                 // 矩阵大小（行数）
+    ULL nCols_{ 0 };                // 列数（并行时包含幽灵单元）
+    Scalar ghostRowSink_{ 0.0 };    // 幽灵行写入的丢弃位置
     std::vector<std::vector<Scalar>> unCompressedMatrix_;   // 未压缩的矩阵
     std::vector<Tp> b_;             // 右侧向量 Ax = b
     Field<Tp>* fieldPtr_{ nullptr };   // 存储phi，调用离散项函数的时候用到
@@ -155,6 +169,7 @@ private:
 template<typename Tp>
 inline SparseMatrix<Tp>::SparseMatrix(const std::vector<std::vector<Scalar>>& matrix)
     : size_(matrix.size())
+    , nCols_(matrix.size())
     , unCompressedMatrix_(matrix)
     , b_(matrix.size())
 {
@@ -180,6 +195,7 @@ inline SparseMatrix<Tp>::SparseMatrix(Mesh* mesh)
 template<typename Tp>
 inline SparseMatrix<Tp>::SparseMatrix(ULL size)
     : size_(size)
+    , nCols_(size)
     , unCompressedMatrix_(size, std::vector<Scalar>(size))
     , isValid_(true)
 {}
@@ -276,18 +292,21 @@ inline void SparseMatrix<Tp>::init(Mesh* mesh)
     }
 
 
-    size_ = mesh->getCellNumber();
+    size_ = mesh->getCellNumber();          // 自有单元（行）
+    nCols_ = mesh->getLocalCellNumber();    // 自有 + 幽灵单元（列）
     mesh_ = mesh;
     b_.resize(size_);
 
 
     // 先取出必要的变量
     const std::vector<Face>& faces = mesh->getFaces();
+    const std::vector<Cell>& cells = mesh->getCells();
 
     // 给values_和colIndex_预分配内存,二者一一对应
     ULL elementNumber = 0;
-    for (const Cell& cell : mesh->getCells())
+    for (ULL cellIndex = 0; cellIndex < size_; ++cellIndex)
     {
+        const Cell& cell = cells[cellIndex];
         elementNumber += cell.getFaceNum() + 1; // 若为内部纯内部单元则elementNumber为该行的非0元素个数
 
         // 去除边界面的数量（无邻单元需要减去）
@@ -300,25 +319,23 @@ inline void SparseMatrix<Tp>::init(Mesh* mesh)
         }
     }
     values_.resize(elementNumber);      // 便于之后访问
-    // colIndexs_.resize(elementNumber);
     colIndexs_.reserve(elementNumber);
 
     // 给rowPointer_预分配内存
-    // rowPointer_.resize(size_ + 1);
-    // rowPointer_[0] = 0;
     rowPointer_.reserve(size_ + 1);
     rowPointer_.emplace_back(0);
 
 
     // 构造colIndex_与rowPointer_
-    ULL currentCellIndex = 0;  // 记录当前遍历到第几个单元（第几行）
-    std::priority_queue<ULL, std::vector<ULL>, std::greater<>> neighborCellQueue;       // 小根堆
-    LL neighborCellIndex = -1; // 存储当前单元的邻居单元号
-    for (const Cell& cell : mesh->getCells())
+    // 每行的列按全局单元编号升序排列（串行时局部编号即全局编号），
+    // 保证并行与串行的矩阵行内元素顺序相同。
+    std::vector<std::pair<ULL, ULL>> rowColumns;   // (全局编号, 局部编号)
+    for (ULL currentCellIndex = 0; currentCellIndex < size_; ++currentCellIndex)
     {
-        // 通过便利cell的所有面找到与当前cell邻居单元号（需要按顺序）
-        std::vector<ULL> FaceIndexes = cell.getFaceIndexes();
-        for (const ULL& neighborFaceId : FaceIndexes)
+        const Cell& cell = cells[currentCellIndex];
+        rowColumns.clear();
+        // 通过遍历cell的所有面找到与当前cell邻居单元号
+        for (const ULL& neighborFaceId : cell.getFaceIndexes())
         {
             if (faces[neighborFaceId].getNeighborIndex() == -1)  // 边界面没有邻单元，直接跳过。
             {
@@ -328,26 +345,23 @@ inline void SparseMatrix<Tp>::init(Mesh* mesh)
             const Face& neighborFace = faces[neighborFaceId];
 
             // 先确定邻单元号
-            neighborCellIndex = (
+            const ULL neighborCellIndex = (
                 currentCellIndex == neighborFace.getOwnerIndex() ?
-                neighborFace.getNeighborIndex() :
+                static_cast<ULL>(neighborFace.getNeighborIndex()) :
                 neighborFace.getOwnerIndex()
                 );
-            neighborCellQueue.emplace(neighborCellIndex);
+            rowColumns.emplace_back(mesh->getGlobalCellIndex(neighborCellIndex), neighborCellIndex);
         }
-        neighborCellQueue.emplace(currentCellIndex);   // 再将当前自己单元号入队
+        rowColumns.emplace_back(mesh->getGlobalCellIndex(currentCellIndex), currentCellIndex);   // 再将当前自己单元号加入
 
-        // 此时队列中的数字为该行矩阵的非0元素的列索引
-        // 按从小到大顺序放入colIndex_，并构造rowPointer_
-        while (!neighborCellQueue.empty())  // 从小到大依次添加
+        // 按全局编号从小到大放入colIndex_，并构造rowPointer_
+        std::stable_sort(rowColumns.begin(), rowColumns.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [globalCol, localCol] : rowColumns)
         {
-            // colIndexs_[currentColIndex++] = neighborCellQueue.top();
-            colIndexs_.emplace_back(neighborCellQueue.top());
-            neighborCellQueue.pop();
+            colIndexs_.emplace_back(localCol);
         }
-        // rowPointer_[currentCellIndex + 1] = currentColIndex;
         rowPointer_.emplace_back(colIndexs_.size());
-        ++currentCellIndex;
     }
     isValid_ = true;
     isCompressed_ = true;
@@ -363,6 +377,7 @@ inline void SparseMatrix<Tp>::init(const std::vector<std::vector<Scalar>>& matri
     }
 
     size_ = matrix.size();
+    nCols_ = matrix.size();
     unCompressedMatrix_ = matrix;
 
     // 检查是否为方阵，非方阵抛出异常
@@ -469,7 +484,12 @@ inline void SparseMatrix<Tp>::setValue(ULL i, ULL j, Scalar value)
         throw std::invalid_argument("matrix is not valid");
     }
 
-    if (i >= size_ || j >= size_)
+    if (isGhostRow(i) && j < nCols_)
+    {
+        return;     // 幽灵行由相邻进程装配
+    }
+
+    if (i >= size_ || j >= nCols_)
     {
         std::cerr << "SparseMatrix<Tp>::setValue(ULL i, ULL j, Scalar value) Error: index out of range" << std::endl;
         throw std::out_of_range("index out of range");
@@ -484,7 +504,7 @@ inline void SparseMatrix<Tp>::setValue(ULL i, ULL j, Scalar value)
     const ULL rowBegin = rowPointer_[i];
     const ULL rowEnd = rowPointer_[i + 1];
 
-    // CSR 每行的 colIndexs_ 已经按升序排列；当 colIndex > j 时可以提前停止。
+    // 串行时 CSR 每行的 colIndexs_ 已经按升序排列；当 colIndex > j 时可以提前停止。
     for (ULL index = rowBegin; index < rowEnd; ++index)
     {
         const ULL col = colIndexs_[index];
@@ -495,7 +515,8 @@ inline void SparseMatrix<Tp>::setValue(ULL i, ULL j, Scalar value)
             return;
         }
 
-        if (col > j)
+        // 并行时列按全局编号排序，局部编号不一定升序，不能提前停止
+        if (col > j && (mesh_ == nullptr || !mesh_->isDistributed()))
         {
             break;
         }
@@ -517,7 +538,12 @@ inline void SparseMatrix<Tp>::addValue(ULL i, ULL j, Scalar value)
         throw std::invalid_argument("matrix is not valid");
     }
 
-    if (i >= size_ || j >= size_)
+    if (isGhostRow(i) && j < nCols_)
+    {
+        return;     // 幽灵行由相邻进程装配
+    }
+
+    if (i >= size_ || j >= nCols_)
     {
         std::cerr << "SparseMatrix<Tp>::addValue(ULL i, ULL j, Scalar value) Error: index out of range" << std::endl;
         throw std::out_of_range("index out of range");
@@ -532,7 +558,7 @@ inline void SparseMatrix<Tp>::addValue(ULL i, ULL j, Scalar value)
     const ULL rowBegin = rowPointer_[i];
     const ULL rowEnd = rowPointer_[i + 1];
 
-    // CSR 每行的 colIndexs_ 已经按升序排列；当 colIndex > j 时可以提前停止。
+    // 串行时 CSR 每行的 colIndexs_ 已经按升序排列；当 colIndex > j 时可以提前停止。
     for (ULL index = rowBegin; index < rowEnd; ++index)
     {
         const ULL col = colIndexs_[index];
@@ -543,7 +569,8 @@ inline void SparseMatrix<Tp>::addValue(ULL i, ULL j, Scalar value)
             return;
         }
 
-        if (col > j)
+        // 并行时列按全局编号排序，局部编号不一定升序，不能提前停止
+        if (col > j && (mesh_ == nullptr || !mesh_->isDistributed()))
         {
             break;
         }
@@ -587,6 +614,10 @@ inline void SparseMatrix<Tp>::setB(ULL index, Tp value)
         b_[index] = value;
         return;
     }
+    if (isGhostRow(index))
+    {
+        return;     // 幽灵行由相邻进程装配
+    }
 
     std::cerr << "SparseMatrix<Tp>::setB(ULL index, Tp value) Error: index out of range" << std::endl;
     throw std::out_of_range("index out of range");
@@ -605,6 +636,10 @@ inline void SparseMatrix<Tp>::addB(ULL index, Tp value)
     {
         b_[index] += value;
         return;
+    }
+    if (isGhostRow(index))
+    {
+        return;     // 幽灵行由相邻进程装配
     }
 
     std::cerr << "SparseMatrix<Tp>::addB(ULL index, Tp value) Error: index out of range" << std::endl;
@@ -707,6 +742,23 @@ inline typename SparseMatrix<Tp>::ULL SparseMatrix<Tp>::size() const
 }
 
 template<typename Tp>
+inline typename SparseMatrix<Tp>::ULL SparseMatrix<Tp>::colSize() const
+{
+    if (!isValid_)
+    {
+        std::cerr << "SparseMatrix<Tp>::colSize() Error: matrix is not valid" << std::endl;
+        throw std::runtime_error("matrix is not valid");
+    }
+    return nCols_;
+}
+
+template<typename Tp>
+inline bool SparseMatrix<Tp>::isGhostRow(ULL i) const
+{
+    return mesh_ != nullptr && i >= size_ && i < nCols_;
+}
+
+template<typename Tp>
 inline const std::vector<Scalar>& SparseMatrix<Tp>::getValues() const
 {
     if (!isValid_)
@@ -767,7 +819,12 @@ inline Scalar SparseMatrix<Tp>::at(ULL i, ULL j) const
         throw std::invalid_argument("matrix is not valid");
     }
 
-    if (i >= size_ || j >= size_)
+    if (isGhostRow(i) && j < nCols_)
+    {
+        return Scalar{};
+    }
+
+    if (i >= size_ || j >= nCols_)
     {
         std::cerr << "SparseMatrix<Tp>::at(ULL i, ULL j) Error: index out of range" << std::endl;
         throw std::out_of_range("index out of range");
@@ -800,6 +857,13 @@ inline Scalar& SparseMatrix<Tp>::operator()(ULL i, ULL j)
         return unCompressedMatrix_[i][j];
     }
 
+    // 并行：幽灵行的写入被丢弃（该行由相邻进程装配）
+    if (i >= size_)
+    {
+        ghostRowSink_ = Scalar{};
+        return ghostRowSink_;
+    }
+
     for (ULL index = rowPointer_[i]; index < rowPointer_[i + 1]; ++index)
     {
         if (colIndexs_[index] == j)
@@ -823,6 +887,11 @@ inline const Scalar& SparseMatrix<Tp>::operator()(ULL i, ULL j) const
     if (!isCompressed_)
     {
         return unCompressedMatrix_[i][j];
+    }
+
+    if (i >= size_)
+    {
+        return zero;
     }
 
     for (ULL index = rowPointer_[i]; index < rowPointer_[i + 1]; ++index)

@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include <exception>
 #include <iostream>
 #include <vector>
@@ -8,8 +9,11 @@
 using Scalar = double;
 using namespace std;;
 
-int main()
+int main(int argc, char** argv)
 {
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
     try {
         std::vector<std::vector<Scalar>> A{
             {1, 1},

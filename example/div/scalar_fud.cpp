@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include "Field.hpp"
 #include "Geometry/Mesh.h"
 // #include "Laplacian.hpp"
@@ -6,8 +7,12 @@
 #include "Div.hpp"
 
 
-int main() {
-    Mesh mesh("/home/gczl/Desktop/yxc/code/CFD_FVM_Solver/tempFile/OpenFOAM_tutorials/cavity/constant/polyMesh");
+int main(int argc, char** argv)
+{
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
+    Mesh mesh("tempFile/OpenFOAM_tutorials/cavity/constant/polyMesh");
     Field<Scalar> T("T", &mesh);
 
     T.setValue(0);

@@ -449,7 +449,8 @@ namespace algorithm {
                 );
             }
 
-            if (options_.pressureReferenceCell >= mesh_->getCellNumber()) {
+            // 压力参考单元为全局单元编号
+            if (options_.pressureReferenceCell >= mesh_->getGlobalCellNumber()) {
                 throw std::runtime_error(
                     "SIMPLE Error: pressureReferenceCell is out of range."
                 );
@@ -643,11 +644,14 @@ namespace algorithm {
                 fvm::Laplacian(pressureCorrEqn_, rAU_.getFaceField(), pCorr_);
                 fvm::Source(pressureCorrEqn_, negDivUCell);
                 // 若没有压力出口则使用参考点的压力，施加惩罚项
+                // （并行时只由拥有该参考单元的进程施加）
                 if (options_.fixedPressurePatches.empty()) {
-                    const ULL refCell = options_.pressureReferenceCell;
-                    const Scalar penalty = options_.pressureReferencePenalty;
-                    pressureCorrEqn_(refCell, refCell) += penalty;
-                    pressureCorrEqn_.addB(refCell, 0.0);
+                    const LL refCell = mesh_->findLocalCell(options_.pressureReferenceCell);
+                    if (refCell >= 0) {
+                        const Scalar penalty = options_.pressureReferencePenalty;
+                        pressureCorrEqn_(static_cast<ULL>(refCell), static_cast<ULL>(refCell)) += penalty;
+                        pressureCorrEqn_.addB(static_cast<ULL>(refCell), 0.0);
+                    }
                 }
 
                 pressureCorrSolver.init(pCorr_.getCellField().getData());
@@ -873,12 +877,16 @@ namespace algorithm {
             U_.cellToFace();
         }
         inline Scalar SIMPLE::computeContinuityResidual() const {
-            static std::vector<Scalar> cellMassResidual(mesh_->getCellNumber());
+            // 局部存储（含幽灵单元，幽灵单元的累加结果不使用）
+            static std::vector<Scalar> cellMassResidual(mesh_->getLocalCellNumber());
             std::fill(cellMassResidual.begin(), cellMassResidual.end(), Scalar());
-            const std::vector<Cell>& cells = mesh_->getCells();
             const std::vector<Face>& faces = mesh_->getFaces();
+            const ULL nOwnedCells = mesh_->getCellNumber();
 
-            Scalar totalAbsFlux = 0.0;
+            // 各面 |通量|，按串行循环顺序（先内部面、后边界面）做全局求和；
+            // 进程间的面只由 owner 所在进程计入一次
+            std::vector<double> absFluxTerms;
+            absFluxTerms.reserve(mesh_->getFluxFaceOrdering().getLocalNumber());
             // const std::vector<Vector<Scalar>>& UfData = U_.getFaceField().getData();
             const std::vector<Vector<Scalar>>& UfData = Uf_.getData();
 
@@ -891,7 +899,9 @@ namespace algorithm {
 
                 cellMassResidual[owner] += fluxValue;
                 cellMassResidual[neighbor] -= fluxValue;
-                totalAbsFlux += std::abs(fluxValue);
+                if (owner < nOwnedCells) {
+                    absFluxTerms.push_back(std::abs(fluxValue));
+                }
             }
             // 边界面
             for (const ULL faceId : mesh_->getBoundaryFaceIndexes()) {
@@ -900,39 +910,49 @@ namespace algorithm {
                 const Scalar fluxValue = UfData[faceId] & face.getNormal() * face.getArea();
 
                 cellMassResidual[owner] += fluxValue;
-                totalAbsFlux += std::abs(fluxValue);
+                absFluxTerms.push_back(std::abs(fluxValue));
             }
-            // 找到cellMassResidual里最大值
+            // 找到cellMassResidual里最大值（自有单元，全局取最大）
             Scalar maxResidual = 0.0;
-            for (const Scalar& residual : cellMassResidual) {
-                maxResidual = std::max(maxResidual, std::abs(residual));
+            for (ULL cellId = 0; cellId < nOwnedCells; ++cellId) {
+                maxResidual = std::max(maxResidual, std::abs(cellMassResidual[cellId]));
             }
+            maxResidual = par::allReduceMax(maxResidual);
 
-            const Scalar avgAbsFlux = totalAbsFlux / mesh_->getCellNumber();
+            const Scalar totalAbsFlux =
+                mesh_->getFluxFaceOrdering().orderedSums(absFluxTerms, 1)[0];
+
+            const Scalar avgAbsFlux = totalAbsFlux / mesh_->getGlobalCellNumber();
 
             return maxResidual / (avgAbsFlux + SMALL);
         }
         inline Scalar SIMPLE::computeRelativeChange(const std::vector<Scalar>& current, const std::vector<Scalar>& old) const {
-            Scalar numerator = 0.0;
-            Scalar denominator = 0.0;
-
-            for (ULL i = 0; i < current.size(); ++i) {
+            // 只统计自有单元；按全局单元顺序求和，与串行结果一致
+            const ULL nOwnedCells = mesh_->getCellNumber();
+            std::vector<double> terms(2 * nOwnedCells);
+            for (ULL i = 0; i < nOwnedCells; ++i) {
                 const Scalar diff = current[i] - old[i];
 
-                numerator += diff * diff;
-                denominator += current[i] * current[i];
+                terms[2 * i] = diff * diff;
+                terms[2 * i + 1] = current[i] * current[i];
             }
+            const std::vector<double> sums = mesh_->getCellOrdering().orderedSums(terms, 2);
+            const Scalar numerator = sums[0];
+            const Scalar denominator = sums[1];
 
             return std::sqrt(numerator / (denominator + SMALL));
         }
         inline Scalar SIMPLE::computeRelativeChange(const std::vector<Vector<Scalar>>& current, const std::vector<Vector<Scalar>>& old) const
         {
-            Scalar numerator = 0.0;
-            Scalar denominator = 0.0;
-            for (ULL i = 0; i < current.size(); ++i) {
-                numerator += (current[i] - old[i]).magnitudeSquared();
-                denominator += current[i].magnitudeSquared();
+            const ULL nOwnedCells = mesh_->getCellNumber();
+            std::vector<double> terms(2 * nOwnedCells);
+            for (ULL i = 0; i < nOwnedCells; ++i) {
+                terms[2 * i] = (current[i] - old[i]).magnitudeSquared();
+                terms[2 * i + 1] = current[i].magnitudeSquared();
             }
+            const std::vector<double> sums = mesh_->getCellOrdering().orderedSums(terms, 2);
+            const Scalar numerator = sums[0];
+            const Scalar denominator = sums[1];
             return std::sqrt(numerator / (denominator + SMALL));
         }
     }
