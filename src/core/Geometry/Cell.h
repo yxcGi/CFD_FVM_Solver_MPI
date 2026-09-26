@@ -35,6 +35,9 @@ public:
     // 添加face索引
     void addFaceIndex(ULL faceIndex);
 
+    // 直接设置几何信息（并行分解时由 0 号进程计算好的全局几何分发到各进程）
+    void setGeometry(Scalar volume, const Vector<Scalar>& center, std::vector<ULL> pointIndexes);
+
     // 计算单元的几何属性
     void calculateCellInfo(
         const std::vector<Face>& faces,     // mesh里的面列表

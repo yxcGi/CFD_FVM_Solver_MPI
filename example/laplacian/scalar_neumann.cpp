@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include <exception>
 #include <iostream>
 
@@ -8,7 +9,11 @@
 #include "SparseMatrix.hpp"
 
 
-int main() {
+int main(int argc, char** argv)
+{
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
     using Scalar = double;
     Mesh mesh("tempFile/OpenFOAM_tutorials/cavity/constant/polyMesh");
 

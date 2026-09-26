@@ -301,7 +301,8 @@ inline typename BaseField<Tp>::ULL BaseField<Tp>::getDataNumer() const
 {
     if (type_ == field::FieldType::CELL_FIELD)
     {
-        return mesh_->getCellNumber();
+        // 单元场存储：自有单元 + 幽灵单元（串行时幽灵单元数为 0）
+        return mesh_->getLocalCellNumber();
     }
     else if (type_ == field::FieldType::FACE_FIELD)
     {

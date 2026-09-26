@@ -36,6 +36,13 @@ void Cell::addFaceIndex(ULL faceIndex)
     faceIndexes_.emplace_back(faceIndex);
 }
 
+void Cell::setGeometry(Scalar volume, const Vector<Scalar>& center, std::vector<ULL> pointIndexes)
+{
+    volume_ = volume;
+    center_ = center;
+    pointIndexes_ = std::move(pointIndexes);
+}
+
 void Cell::calculateCellInfo(
     const std::vector<Face>& faces,
     const std::vector<Point>& points

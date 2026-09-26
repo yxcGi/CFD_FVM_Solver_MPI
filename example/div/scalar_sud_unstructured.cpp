@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include "Field.hpp"
 #include "Geometry/Mesh.h"
 #include "Solver.hpp"
@@ -6,7 +7,11 @@
 
 
 // 非结构网格测试
-int main() {
+int main(int argc, char** argv)
+{
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
     Mesh mesh("tempFile/OpenFOAM_tutorials/cavity2D_tri1/constant/polyMesh");
     Field<Scalar> T("T", &mesh);
 

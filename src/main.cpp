@@ -1,3 +1,4 @@
+#include "Parallel/Parallel.h"
 #include <iostream>
 #include "Laplacian.hpp"
 #include "Vector.hpp"
@@ -16,7 +17,11 @@
 
 
 using Scalar = double;
-int main() {
+int main(int argc, char** argv)
+{
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
 
     // 三维方腔(非结构)
 #if 1

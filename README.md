@@ -14,6 +14,9 @@
 
 项目主要用于 **CFD 算法学习、有限体积法开发、非结构网格离散验证、SIMPLE 算法实现验证**。
 
+本仓库（CFD_FVM_Solver_MPI）在原串行求解器的基础上实现了 **MPI 区域分解并行**：所有算例都可以用 `mpirun -np N` 运行，
+且任意进程数下的计算结果、输出文件与原串行程序**逐位一致**。详见 [MPI 并行](#mpi-并行)。
+
 ---
 
 # 算例展示
@@ -718,8 +721,11 @@ options.pressureReferencePenalty = 1e20;
 
 using Scalar = double;
 
-int main()
+int main(int argc, char** argv)
 {
+    // MPI 并行环境（单进程运行时等价于串行程序）
+    par::Environment env(argc, argv);
+
     Mesh mesh("tempFile/OpenFOAM_tutorials/cavity3D_4/constant/polyMesh");
 
     Field<Vector<Scalar>> U("U", &mesh);
@@ -799,6 +805,9 @@ CFD_FVM_Solver
 │       │   ├── DivType.h
 │       │   ├── Laplacian.hpp
 │       │   └── Source.hpp
+│       ├── Parallel
+│       │   ├── Parallel.h / Parallel.cpp          # MPI 通信层
+│       │   └── Decomposition.h / Decomposition.cpp # RCB 区域分解
 │       ├── Math
 │       │   ├── Solver.hpp
 │       │   ├── SparseMatrix.hpp
@@ -829,6 +838,8 @@ CFD_FVM_Solver
 │   └── matrix
 │       ├── sparse_matrix_access_test.cpp
 │       └── sparse_matrix_solver_test.cpp
+├── tools
+│   └── compare_parallel.sh     # 不同进程数结果一致性检查
 ├── tempFile
 ├── build
 ├── bin
@@ -846,7 +857,14 @@ CFD_FVM_Solver
 - Linux；
 - GCC 11 或更新版本；
 - CMake 3.15 或更新版本；
-- C++20。
+- C++20；
+- MPI（OpenMPI / MPICH / Intel MPI 均可，可选）。
+
+Ubuntu 上安装 OpenMPI：
+
+```bash
+sudo apt install openmpi-bin libopenmpi-dev
+```
 
 当前顶层 CMake 使用：
 
@@ -874,6 +892,15 @@ rm -rf build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j
 ```
+
+CMake 默认查找 MPI：找到时编译并行版本（`MPI found: ... (parallel build)`），找不到时自动编译为单进程版本。
+也可以显式关闭 MPI：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCFD_USE_MPI=OFF
+```
+
+单进程版本与原串行程序完全相同，不依赖 MPI。
 
 ---
 
@@ -967,6 +994,17 @@ lib/libcore.so
 ./bin/matrix_sparse_matrix_solver_test
 ```
 
+### 8.10 MPI 并行运行
+
+所有算例都可以直接用 `mpirun` 并行运行，例如 4 个进程计算台阶流：
+
+```bash
+mpirun -np 4 ./bin/simple_pitz_daily_steady
+```
+
+直接运行 `./bin/xxx`（不加 `mpirun`）即为单进程运行。
+输出文件与串行运行完全相同（同名、同格式、逐字节一致），由 0 号进程写出。
+
 ---
 
 ## 9. 添加新算例
@@ -996,6 +1034,16 @@ example/simple/my_new_case.cpp
 
 ```text
 bin/simple_my_new_case
+```
+
+新算例的 `main` 函数第一行需要构造 MPI 环境（它必须比所有 `Mesh`、`Field` 对象活得更久）：
+
+```cpp
+int main(int argc, char** argv)
+{
+    par::Environment env(argc, argv);
+    // ...
+}
 ```
 
 ---
@@ -1248,6 +1296,74 @@ options.useRhieChow = true;
 
 ---
 
+## MPI 并行
+
+### 并行架构
+
+```text
+                0 号进程                                  各进程（含 0 号）
+  ┌──────────────────────────────────┐        ┌───────────────────────────────────┐
+  │ 读取完整 polyMesh，计算全局几何     │        │ 局部网格 = 自有单元 + 一层幽灵单元      │
+  │ RCB 区域分解（按单元中心递归二分）   │ ─────▶ │ 局部面 = 与自有单元相邻的全部面          │
+  │ 打包各进程的局部网格与 halo 列表     │  发送   │ 离散装配、Jacobi 迭代只处理自有单元       │
+  └──────────────────────────────────┘        │ 幽灵单元的值/梯度通过 halo 交换更新      │
+                                              └───────────────────────────────────┘
+```
+
+1. **区域分解**：0 号进程读取完整网格并计算所有几何量（面心、法向、面积、体心、体积），
+   用内置的递归坐标二分（RCB）算法按单元划分，不依赖 METIS 等外部库。
+   几何量由全局网格计算后直接分发，各进程上的几何与串行完全相同。
+2. **局部网格**：每个进程保存自有单元和一层幽灵单元（相邻进程的单元副本）。
+   进程之间的面作为普通内部面处理，所以 `fvm::Laplacian`、`fvm::Div`、`fvm::Source`、
+   梯度、插值、Rhie-Chow 等代码与串行共用同一套实现。
+3. **Halo 交换**：`Field::cellToFace()` 开始时更新幽灵单元的值，结束时更新幽灵单元的梯度；
+   Jacobi 每次迭代交换一次幽灵单元的解，并用非阻塞通信与内部行的残差计算重叠。
+4. **矩阵**：每个进程只保存自有单元对应的行，列可以指向幽灵单元；离散算子对幽灵行的写入被自动忽略。
+5. **全局归约**：Jacobi 的最大残差用 `MPI_Allreduce(MAX)`；SIMPLE 收敛判据中的求和
+   按串行循环的全局顺序累加，保证与串行结果逐位一致。
+6. **输出**：各进程的结果收集到 0 号进程，按全局单元编号排列后用完整网格写出 Tecplot 文件。
+
+### 如何保证与串行结果逐位一致
+
+浮点加法不满足结合律，只要累加顺序变了结果就可能在最后几位不同，经过成千上万次 SIMPLE 迭代后差异还会放大。
+因此并行实现严格保持了串行程序的运算顺序：
+
+- 局部面、局部单元的编号保持全局编号的相对顺序，每个单元的面循环、矩阵元素的累加顺序与串行相同；
+- 边界 patch 按与串行相同的顺序插入 `unordered_map`，边界循环顺序相同；
+- 矩阵每行的列按全局单元编号排序，Jacobi 每行的求和顺序相同；
+- 需要求和的全局量（速度/压力相对变化、连续性残差中的总通量）收集到 0 号进程按全局顺序累加；
+- 编译时加入 `-ffp-contract=off`，禁止编译器生成 FMA 指令改变舍入。
+
+另外，原程序的 Jacobi 串行分支与线程池分支写法不同（舍入不同），走哪条分支由矩阵规模和机器核数决定。
+并行版本按同样的规则选择写法，所以在同一台机器上与原串行程序逐位一致。
+多进程时每个进程默认只用 1 个线程，可用环境变量 `CFD_THREADS_PER_PROCESS` 设置每个进程的线程数（不影响计算结果）。
+
+### 一致性检查
+
+`tools/compare_parallel.sh` 先以单进程运行算例，再以指定进程数运行，逐字节比较输出文件和屏幕日志：
+
+```bash
+tools/compare_parallel.sh laplacian_scalar_dirichlet 2 3 4
+tools/compare_parallel.sh simple_pitz_daily_steady 2 4
+```
+
+### 编程接口
+
+| 接口 | 说明 |
+|---|---|
+| `par::Environment env(argc, argv)` | MPI 初始化 / 结束；非 0 号进程的 `std::cout` 静默 |
+| `par::rank()` / `par::size()` / `par::isMaster()` | 进程号、进程数 |
+| `mesh.getCellNumber()` | 本进程自有单元数（串行时为全部单元数） |
+| `mesh.getLocalCellNumber()` | 自有 + 幽灵单元数（单元场数组长度） |
+| `mesh.getGlobalCellNumber()` | 全局单元数 |
+| `mesh.getGlobalCellIndex(i)` / `mesh.findLocalCell(g)` | 局部编号与全局编号互相转换 |
+| `mesh.getHalo().exchange(data)` | 更新单元数组中幽灵单元的值 |
+
+`Mesh`、`Field`、`SparseMatrix` 等接口中的单元/面索引均为**局部索引**（串行时即全局索引）。
+`SIMPLE::Options::pressureReferenceCell` 为全局单元编号。
+
+---
+
 ## 13. 当前限制
 
 当前项目仍处于开发阶段，以下功能仍需完善：
@@ -1272,9 +1388,10 @@ options.useRhieChow = true;
 
    当前通过 Robin 统一形式覆盖常见 Dirichlet / Neumann / Robin 边界，复杂工程边界仍需继续封装。
 
-6. **并行仅限共享内存线程并行**
+6. **MPI 并行的网格读入在 0 号进程完成**
 
-   当前没有 MPI 区域分解并行。
+   0 号进程读取完整网格并做区域分解，结果输出时也由 0 号进程收集并写出完整场。
+   对于特别大的网格，0 号进程的内存会成为瓶颈，后续可改为预分解的并行读写。
 
 ---
 
