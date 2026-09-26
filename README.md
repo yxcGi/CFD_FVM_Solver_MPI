@@ -1438,6 +1438,10 @@ tools/compare_gpu.sh simple_cavity3d_unstructured 1 2
 tools/compare_gpu.sh simple_pitz_daily_steady 1
 ```
 
+只想快速确认结果是否一致，可以运行 `tools/verify_gpu.sh`：它自动编译并运行一个只算 5 步的三维方腔算例
+（CPU 一次、GPU 一次，有 MPI 时再用 2 个进程在 GPU 上跑一次），全部逐字节一致时只输出 `true`，否则输出 `false`
+（原因写在 `build/verify_gpu/verify.log`）。
+
 没有 GPU 时，可用 `-DCFD_GPU_EMULATE=ON` 编译一个“主机模拟 GPU”的版本做测试：
 它与 CUDA 版本走同一条代码路径（上传、halo 打包/解包、残差分组、交换、下载），只是把内核换成主机循环。
 
