@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.0 - GPU (CUDA) parallel linear solver
+
+### Added
+
+- CUDA backend for the Jacobi linear solver (`src/core/Gpu/`): MPI + GPU, one GPU
+  per process (device = node-local rank % GPUs per node). The matrix is uploaded
+  once per solve; iterations stay on the GPU and only halo values go through MPI.
+- Results are bitwise identical to the CPU version (same per-row summation order,
+  shared row kernels in `JacobiRow.h`, `-fmad=false`, IEEE division/sqrt).
+- CMake option `CFD_USE_CUDA` (ON by default; CPU-only build when nvcc is not found).
+  Runtime falls back to the CPU when no GPU is present or `CFD_USE_GPU=0`.
+- CMake option `CFD_GPU_EMULATE` (testing only): host emulation of the GPU backend.
+- `tools/compare_gpu.sh` to compare GPU runs with the CPU reference, and
+  `tools/verify_gpu.sh` (prints only true/false) with the 5-step `gpu_quick_check` example.
+- `par::HaloExchange::startPacked()/finishPacked()` and `par::nodeLocalRank()`.
+
 ## v0.2.0 - MPI parallel solver
 
 ### Added
