@@ -17,6 +17,9 @@
 本仓库（CFD_FVM_Solver_MPI）在原串行求解器的基础上实现了 **MPI 区域分解并行**：所有算例都可以用 `mpirun -np N` 运行，
 且任意进程数下的计算结果、输出文件与原串行程序**逐位一致**。详见 [MPI 并行](#mpi-并行)。
 
+在此基础上还支持 **GPU 并行（CUDA）**：MPI + GPU，每个进程使用一块 GPU 做线性方程组的 Jacobi 迭代，
+结果同样与 CPU 版本逐位一致；没有 CUDA 或没有 GPU 时自动使用 CPU。详见 [GPU 并行](#gpu-并行)。
+
 ---
 
 # 算例展示
@@ -858,7 +861,8 @@ CFD_FVM_Solver
 - GCC 11 或更新版本；
 - CMake 3.15 或更新版本；
 - C++20；
-- MPI（OpenMPI / MPICH / Intel MPI 均可，可选）。
+- MPI（OpenMPI / MPICH / Intel MPI 均可，可选）；
+- CUDA Toolkit 11.x / 12.x 与 NVIDIA 显卡（可选，用于 GPU 并行）。
 
 Ubuntu 上安装 OpenMPI：
 
@@ -898,6 +902,19 @@ CMake 默认查找 MPI：找到时编译并行版本（`MPI found: ... (parallel
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCFD_USE_MPI=OFF
+```
+
+CMake 默认也会查找 CUDA 编译器（nvcc）：找到时编译 GPU 版本（`CUDA found: ... (GPU build ...)`），找不到时只编译 CPU 版本。
+默认为 sm_70、75、80、86、89、90 生成代码，可只编译自己显卡的架构以加快编译，例如 RTX 3090（sm_86）：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+```
+
+显式关闭 CUDA：
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCFD_USE_CUDA=OFF
 ```
 
 单进程版本与原串行程序完全相同，不依赖 MPI。
@@ -1004,6 +1021,22 @@ mpirun -np 4 ./bin/simple_pitz_daily_steady
 
 直接运行 `./bin/xxx`（不加 `mpirun`）即为单进程运行。
 输出文件与串行运行完全相同（同名、同格式、逐字节一致），由 0 号进程写出。
+
+### 8.11 GPU 并行运行
+
+用 CUDA 编译后，算例在有 GPU 的机器上自动使用 GPU，命令不变：
+
+```bash
+./bin/simple_cavity3d_unstructured              # 单进程 + 1 块 GPU
+mpirun -np 2 ./bin/simple_cavity3d_unstructured # 2 个进程，各用 1 块 GPU
+```
+
+每个进程启动时会在 stderr 打印所用的设备，例如 `[GPU] rank 0 -> GPU 0 (NVIDIA GeForce RTX 3090, sm_86)`。
+设置 `CFD_USE_GPU=0` 可强制使用 CPU：
+
+```bash
+CFD_USE_GPU=0 ./bin/simple_cavity3d_unstructured
+```
 
 ---
 
@@ -1364,6 +1397,52 @@ tools/compare_parallel.sh simple_pitz_daily_steady 2 4
 
 ---
 
+## GPU 并行
+
+### 架构
+
+```text
+  每个 MPI 进程（区域分解与 MPI 版本相同）
+  ┌──────────────── CPU ────────────────┐        ┌──────────────── GPU ────────────────┐
+  │ 离散装配（Laplacian / Div / Source）   │ 上传    │ CSR 矩阵、对角元、右端项、初值            │
+  │ 梯度、插值、Rhie-Chow、SIMPLE 流程     │ ─────▶ │ Jacobi 迭代：一个线程一行（更新 + 残差）   │
+  │ halo 交换（MPI）                       │ ◀───── │ 只把边界单元的值打包下载，接收后上传       │
+  └─────────────────────────────────────┘ 幽灵值  │ 收敛后下载解                            │
+                                                  └─────────────────────────────────────┘
+```
+
+1. **进程与设备**：每个 MPI 进程使用一块 GPU，设备号 = 节点内进程序号 % 节点 GPU 数。
+   单节点多卡时用 `mpirun -np <GPU 数>` 即可一卡一进程。
+2. **GPU 上做什么**：SIMPLE 每步的动量方程、压力修正方程都用 Jacobi 迭代求解，
+   迭代次数多、每次都要遍历整个矩阵，是主要的计算量。GPU 版本把整个迭代放在显存中：
+   矩阵每次求解只上传一次，迭代过程中只有幽灵单元的值经主机做 MPI 交换，残差只回传每个线程块的最大值。
+3. **通信与计算重叠**：与 CPU 版本相同，发起 halo 交换后先在 GPU 上计算内部行的残差，
+   交换完成后再计算边界行的残差。
+4. **CPU 回退**：未用 CUDA 编译、运行时找不到 GPU、或设置 `CFD_USE_GPU=0` 时使用原来的 CPU 实现。
+
+### 如何保证与 CPU 结果逐位一致
+
+- 每个 GPU 线程负责一行，按 CSR 中的列顺序累加，与 CPU 循环顺序相同；GPU 内核与 CPU 版本使用
+  同一套单行计算代码（`src/core/Gpu/JacobiRow.h`），CPU 的两种 Jacobi 写法也都保留；
+- nvcc 使用 `-fmad=false` 禁止 FMA 融合（对应 CPU 的 `-ffp-contract=off`），不使用 `--use_fast_math`，
+  除法、开方为 IEEE 精确舍入；
+- 最大残差的归约与顺序无关，结果与 CPU 相同。
+
+### 一致性检查
+
+`tools/compare_gpu.sh` 先用 `CFD_USE_GPU=0` 在 CPU 上以单进程运行算例，再在 GPU 上以指定进程数运行，
+逐字节比较输出文件和屏幕日志：
+
+```bash
+tools/compare_gpu.sh simple_cavity3d_unstructured 1 2
+tools/compare_gpu.sh simple_pitz_daily_steady 1
+```
+
+没有 GPU 时，可用 `-DCFD_GPU_EMULATE=ON` 编译一个“主机模拟 GPU”的版本做测试：
+它与 CUDA 版本走同一条代码路径（上传、halo 打包/解包、残差分组、交换、下载），只是把内核换成主机循环。
+
+---
+
 ## 13. 当前限制
 
 当前项目仍处于开发阶段，以下功能仍需完善：
@@ -1392,6 +1471,11 @@ tools/compare_parallel.sh simple_pitz_daily_steady 2 4
 
    0 号进程读取完整网格并做区域分解，结果输出时也由 0 号进程收集并写出完整场。
    对于特别大的网格，0 号进程的内存会成为瓶颈，后续可改为预分解的并行读写。
+
+7. **GPU 目前只加速线性求解**
+
+   离散装配、梯度与插值仍在 CPU 上进行，矩阵每次线性求解时上传到 GPU。
+   GPU 只支持 CUDA（NVIDIA 显卡），索引使用 32 位整数（单个进程的单元数和非零元个数需小于 2^31）。
 
 ---
 

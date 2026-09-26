@@ -55,6 +55,8 @@ namespace par
     bool isParallel();
     // 同一节点上的进程数（用于决定每个进程可用的线程数）
     int nodeLocalSize();
+    // 本进程在所在节点内的序号（用于为每个进程分配 GPU）
+    int nodeLocalRank();
 
     // 终止所有进程
     [[noreturn]] void abort(int errorCode = 1);
@@ -178,6 +180,21 @@ namespace par
                 }
             }
         }
+
+        /**
+         * @brief 以"已打包"的数据发起非阻塞交换（数据在 GPU 上时使用）。
+         *
+         * packed 按邻居顺序拼接，第 n 个邻居占 sendIndexes[n].size() * nc 个 double，
+         * 与 start() 内部打包的顺序完全相同。
+         */
+        void startPacked(const std::vector<double>& packed, std::size_t nc) const;
+
+        // 等待交换完成，按邻居顺序拼接返回接收数据（与 recvIndexes 一一对应）
+        void finishPacked(std::vector<double>& packed, std::size_t nc) const;
+
+        // 所有邻居的发送 / 接收条目总数
+        std::size_t totalSendCount() const;
+        std::size_t totalRecvCount() const;
 
     private:
         void prepareBuffers(std::size_t nComponents) const;

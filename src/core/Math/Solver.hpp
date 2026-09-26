@@ -11,6 +11,7 @@
 #include "Field.hpp"
 #include "threadpool.hpp"
 #include "Parallel/Parallel.h"
+#include "Gpu/Gpu.h"
 
 
 /**
@@ -22,6 +23,10 @@
  *    每次 Jacobi 迭代交换一次幽灵单元的解（非阻塞通信，与内部行的残差计算重叠），
  *    最大残差通过 Allreduce 取全局最大值。由于 Jacobi 每行的更新只依赖上一步的解，
  *    且每行的列顺序与串行相同，并行结果与串行结果逐位一致。
+ *  - GPU 并行：编译时启用 CUDA 且运行时检测到 GPU 时，Jacobi 迭代在 GPU 上进行
+ *    （矩阵每次求解上传一次，迭代全程留在显存中，只有幽灵单元数据经主机做 MPI 交换）。
+ *    GPU 内核按与 CPU 相同的顺序计算每一行，结果与 CPU 逐位一致。
+ *    环境变量 CFD_USE_GPU=0 可强制使用 CPU。
  *  - 线程池并行：setParallel() 开启。单进程时与原实现相同；
  *    多进程时每个进程默认使用 1 个线程，可通过环境变量 CFD_THREADS_PER_PROCESS 调整。
  *
@@ -77,6 +82,13 @@ public:
 private:
     // Jacobi 迭代（串行 / 线程 / MPI 统一实现）
     void JacobiSolve();
+
+    // Jacobi 迭代的 GPU 实现（结果写入 x_，与 CPU 迭代相同）
+    void JacobiIterateGpu(const std::vector<Scalar>& diag,
+                          bool splitFormula,
+                          const par::HaloExchange* halo,
+                          const std::vector<ULL>& interiorRows,
+                          const std::vector<ULL>& haloRows);
 
     // 原实现线程池分支使用的线程数（由矩阵全局规模和核数决定）
     static unsigned originalThreadNum(ULL globalSize);
@@ -470,6 +482,27 @@ inline void Solver<Tp>::JacobiSolve()
         }
     }
 
+    // 求解结束：把解写回场
+    auto writeBack = [&]() {
+        if (filed_ != nullptr)
+        {
+            if (splitFormula)
+            {
+                // cellField    ：本次线性求解后的新解
+                // cellField_0  ：本次线性求解前的旧解
+                filed_->getCellField().getData() = x_;
+                filed_->getCellField_0().getData() = oldSolution;
+            }
+            else
+            {
+                // 新值给cellField_0的，再与cellField交换
+                filed_->getCellField_0().getData() = std::move(x_);
+                filed_->getCellField_0().getData().
+                    swap(filed_->getCellField().getData());
+            }
+        }
+    };
+
     // 单行 Jacobi 更新
     auto updateRow = [&](ULL i) {
         if (splitFormula)
@@ -608,6 +641,13 @@ inline void Solver<Tp>::JacobiSolve()
         return localMax;
     };
 
+    if (gpu::enabled())
+    {
+        JacobiIterateGpu(diag, splitFormula, halo, interiorRows, haloRows);
+        writeBack();
+        return;
+    }
+
     for (int it = 0; it < maxIterationNum_; ++it)
     {
         // 1. Jacobi 更新（只读 x0_，只写 x_ 的自有部分）
@@ -632,23 +672,7 @@ inline void Solver<Tp>::JacobiSolve()
         if (maxResidual < tolerance_ ||
             it == maxIterationNum_ - 1)
         {
-            if (filed_ != nullptr)
-            {
-                if (splitFormula)
-                {
-                    // cellField    ：本次线性求解后的新解
-                    // cellField_0  ：本次线性求解前的旧解
-                    filed_->getCellField().getData() = x_;
-                    filed_->getCellField_0().getData() = oldSolution;
-                }
-                else
-                {
-                    // 新值给cellField_0的，再与cellField交换
-                    filed_->getCellField_0().getData() = std::move(x_);
-                    filed_->getCellField_0().getData().
-                        swap(filed_->getCellField().getData());
-                }
-            }
+            writeBack();
             return;
         }
 
@@ -658,7 +682,106 @@ inline void Solver<Tp>::JacobiSolve()
 }
 
 
+template<typename Tp>
+inline void Solver<Tp>::JacobiIterateGpu(const std::vector<Scalar>& diag,
+                                         bool splitFormula,
+                                         const par::HaloExchange* halo,
+                                         const std::vector<ULL>& interiorRows,
+                                         const std::vector<ULL>& haloRows)
+{
+    static_assert(std::is_same_v<Tp, Scalar> || std::is_same_v<Tp, Vector<Scalar>>,
+                  "Solver: unsupported Tp type");
+    constexpr int nc = static_cast<int>(par::nComponents<Tp>());
 
+    const ULL size = equation_.size();
+    const ULL colSize = equation_.colSize();
+
+    // 矢量场：CPU 实现中 Vector / 0（|diag| < 1e-12，见 Vector::isZero）会抛出异常，这里保持相同行为
+    if constexpr (std::is_same_v<Tp, Vector<Scalar>>)
+    {
+        for (ULL row = 0; row < size; ++row)
+        {
+            if (std::abs(diag[row]) < 1e-12)
+            {
+                std::cerr << "Error: Division by zero in Vector::operator/." << std::endl;
+                throw std::invalid_argument("Division by zero");
+            }
+        }
+    }
+
+    gpu::JacobiGpu device(nc);
+    device.upload(size, colSize,
+                  equation_.getRowPointer(), equation_.getColIndexs(), equation_.getValues(),
+                  diag, reinterpret_cast<const double*>(equation_.getB().data()),
+                  splitFormula);
+
+    const bool overlap = (halo != nullptr && !halo->empty());
+    if (overlap)
+    {
+        std::vector<ULL> sendIndexes;
+        std::vector<ULL> recvIndexes;
+        for (const auto& list : halo->getSendIndexes())
+        {
+            sendIndexes.insert(sendIndexes.end(), list.begin(), list.end());
+        }
+        for (const auto& list : halo->getRecvIndexes())
+        {
+            recvIndexes.insert(recvIndexes.end(), list.begin(), list.end());
+        }
+        device.setHalo(sendIndexes, recvIndexes);
+        device.setRowSets(interiorRows, haloRows);
+    }
+
+    // x0_ 的幽灵单元已在调用前交换
+    device.setX0(reinterpret_cast<const double*>(x0_.data()));
+
+    std::vector<double> sendPacked;
+    std::vector<double> recvPacked;
+    for (int it = 0; it < maxIterationNum_; ++it)
+    {
+        // 1. Jacobi 更新
+        device.update();
+
+        // 2. 残差：发起 x 幽灵单元交换，同时在 GPU 上计算内部行残差
+        Scalar maxResidual{};
+        if (halo != nullptr)
+        {
+            if (overlap)
+            {
+                device.gatherSend(sendPacked);
+                halo->startPacked(sendPacked, nc);
+                device.launchResidual(1);
+                halo->finishPacked(recvPacked, nc);
+                maxResidual = device.finishResidual();
+                device.scatterRecv(recvPacked);
+                device.launchResidual(2);
+                maxResidual = std::max(maxResidual, device.finishResidual());
+            }
+            else
+            {
+                device.launchResidual(0);
+                maxResidual = device.finishResidual();
+            }
+            maxResidual = par::allReduceMax(maxResidual);
+        }
+        else
+        {
+            device.launchResidual(0);
+            maxResidual = device.finishResidual();
+        }
+
+        if (maxResidual < tolerance_ ||
+            it == maxIterationNum_ - 1)
+        {
+            break;
+        }
+
+        device.swap();
+    }
+
+    x_.resize(colSize);
+    device.download(reinterpret_cast<double*>(x_.data()));
+}
 
 
 #endif // SOLVER_H_
