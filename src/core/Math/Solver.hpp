@@ -646,11 +646,13 @@ inline void Solver<Tp>::JacobiSolve()
     };
 
     // 小矩阵不用 GPU：每次 Jacobi 迭代都有内核启动与同步的固定开销（约数十微秒，WSL2 下更高），
-    // 矩阵很小时 CPU 一次迭代只要微秒级，GPU 反而慢几十倍。全局行数不足 CFD_GPU_MIN_ROWS（默认 20000，
+    // 矩阵很小时 CPU 一次迭代只要微秒级，GPU 反而慢几十倍。全局行数不足 CFD_GPU_MIN_ROWS（默认 5000，
     // 设为 0 表示始终用 GPU）时走 CPU；两条路径结果逐位相同，切换不影响结果。
+    // 实测（RTX 3060，WSL2）：400 单元二维方腔 GPU 慢 28 倍，10250 单元三维方腔 GPU 快 2.5 倍，
+    // 盈亏平衡约在 5000 行。
     static const ULL gpuMinRows = [] {
         const char* env = std::getenv("CFD_GPU_MIN_ROWS");
-        return env ? static_cast<ULL>(std::strtoull(env, nullptr, 10)) : 20000ULL;
+        return env ? static_cast<ULL>(std::strtoull(env, nullptr, 10)) : 5000ULL;
     }();
     if (gpu::enabled())
     {

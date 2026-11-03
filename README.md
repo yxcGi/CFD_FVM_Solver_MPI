@@ -1040,8 +1040,8 @@ CFD_USE_GPU=0 ./bin/simple_cavity3d_unstructured
 ```
 
 矩阵太小时 GPU 不划算：每次 Jacobi 迭代都有内核启动与同步的固定开销（数十微秒，WSL2 下更高），
-而几百个单元的矩阵 CPU 一次迭代只要微秒级。实测 RTX 3060（WSL2）上 400 单元的二维方腔，GPU 比 CPU 慢约 28 倍，
-10250 单元的三维方腔两者相当。因此全局行数少于 `CFD_GPU_MIN_ROWS`（默认 20000）时自动使用 CPU，
+而几百个单元的矩阵 CPU 一次迭代只要微秒级。实测 RTX 3060（WSL2）上 400 单元的二维方腔，GPU 比 CPU 慢约 28 倍；
+10250 单元的三维方腔 GPU 快 2.5 倍（5 步：CPU 38.2 s，GPU 15.0 s）。因此全局行数少于 `CFD_GPU_MIN_ROWS`（默认 5000）时自动使用 CPU，
 两条路径结果逐位相同；设 `CFD_GPU_MIN_ROWS=0` 可强制小矩阵也用 GPU（验证脚本就是这样做的）：
 
 ```bash
