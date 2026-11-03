@@ -35,6 +35,9 @@
  * 为保证与原串行程序的结果逐位一致，这里保留两种写法，并按原实现的规则
  * （由全局矩阵规模和机器核数决定）选择使用哪一种。
  */
+// 小矩阵改用 CPU 的提示只打印一次（Solver<Scalar> 与 Solver<Vector> 共用）
+inline bool gpuSmallSystemWarned = false;
+
 template <typename Tp>
 class Solver
 {
@@ -642,11 +645,27 @@ inline void Solver<Tp>::JacobiSolve()
         return localMax;
     };
 
+    // 小矩阵不用 GPU：每次 Jacobi 迭代都有内核启动与同步的固定开销（约数十微秒，WSL2 下更高），
+    // 矩阵很小时 CPU 一次迭代只要微秒级，GPU 反而慢几十倍。全局行数不足 CFD_GPU_MIN_ROWS（默认 20000，
+    // 设为 0 表示始终用 GPU）时走 CPU；两条路径结果逐位相同，切换不影响结果。
+    static const ULL gpuMinRows = [] {
+        const char* env = std::getenv("CFD_GPU_MIN_ROWS");
+        return env ? static_cast<ULL>(std::strtoull(env, nullptr, 10)) : 20000ULL;
+    }();
     if (gpu::enabled())
     {
-        JacobiIterateGpu(diag, splitFormula, halo, interiorRows, haloRows);
-        writeBack();
-        return;
+        if (globalSize >= gpuMinRows)
+        {
+            JacobiIterateGpu(diag, splitFormula, halo, interiorRows, haloRows);
+            writeBack();
+            return;
+        }
+        if (!gpuSmallSystemWarned && par::isMaster())
+        {
+            gpuSmallSystemWarned = true;
+            std::cerr << "[GPU] matrix has " << globalSize << " rows < CFD_GPU_MIN_ROWS (" << gpuMinRows
+                << "), using CPU for small systems (set CFD_GPU_MIN_ROWS=0 to force the GPU)" << std::endl;
+        }
     }
 
     for (int it = 0; it < maxIterationNum_; ++it)

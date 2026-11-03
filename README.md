@@ -1039,6 +1039,15 @@ mpirun -np 2 ./bin/simple_cavity3d_unstructured # 2 个进程，各用 1 块 GPU
 CFD_USE_GPU=0 ./bin/simple_cavity3d_unstructured
 ```
 
+矩阵太小时 GPU 不划算：每次 Jacobi 迭代都有内核启动与同步的固定开销（数十微秒，WSL2 下更高），
+而几百个单元的矩阵 CPU 一次迭代只要微秒级。实测 RTX 3060（WSL2）上 400 单元的二维方腔，GPU 比 CPU 慢约 28 倍，
+10250 单元的三维方腔两者相当。因此全局行数少于 `CFD_GPU_MIN_ROWS`（默认 20000）时自动使用 CPU，
+两条路径结果逐位相同；设 `CFD_GPU_MIN_ROWS=0` 可强制小矩阵也用 GPU（验证脚本就是这样做的）：
+
+```bash
+CFD_GPU_MIN_ROWS=0 ./bin/simple_cavity2d_structured
+```
+
 ---
 
 ## 9. 添加新算例
@@ -1420,7 +1429,7 @@ tools/compare_parallel.sh simple_pitz_daily_steady 2 4
 3. **通信与计算重叠**：与 CPU 版本相同，发起 halo 交换后先在 GPU 上计算内部行的残差，
    交换完成后再计算边界行的残差（残差的块最大值经固定内存异步回传，内核与 MPI 通信真正并行）。
    CUDA 流与显存缓冲区跨线性求解复用，每次求解只上传矩阵、右端项与初值。
-4. **CPU 回退**：未用 CUDA 编译、运行时找不到 GPU、或设置 `CFD_USE_GPU=0` 时使用原来的 CPU 实现。
+4. **CPU 回退**：未用 CUDA 编译、运行时找不到 GPU、设置 `CFD_USE_GPU=0`、或矩阵行数少于 `CFD_GPU_MIN_ROWS` 时使用原来的 CPU 实现。
 
 ### 如何保证与 CPU 结果逐位一致
 
@@ -1482,6 +1491,8 @@ tools/compare_gpu.sh simple_pitz_daily_steady 1
 
    离散装配、梯度与插值仍在 CPU 上进行，矩阵每次线性求解时上传到 GPU。
    GPU 只支持 CUDA（NVIDIA 显卡），索引使用 32 位整数（单个进程的单元数和非零元个数需小于 2^31）。
+   每次 Jacobi 迭代在主机侧同步一次残差，固定开销使 GPU 只在大矩阵（数万单元以上）上快于 CPU；
+   本仓库自带的算例都很小，GPU 路径主要用于验证，实际加速要等网格规模上去。
 
 ---
 

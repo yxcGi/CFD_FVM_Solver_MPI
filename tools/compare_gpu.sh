@@ -10,7 +10,7 @@
 #
 # 脚本先用 CFD_USE_GPU=0 以单进程在 CPU 上运行算例作为参考，
 # 再对给定的各进程数在 GPU 上运行（每个进程一块 GPU，GPU 少于进程数时共用），
-# 逐字节比较所有输出的 .dat 文件和屏幕日志。
+# 逐字节比较所有输出的 .dat 文件和屏幕日志（设置 CFD_GPU_MIN_ROWS=0，小算例也走 GPU）。
 # 每次运行在 build/compare_gpu/<算例名>/ 下进行。
 #
 # 可通过环境变量 MPIRUN 指定启动命令（默认 "mpirun"）。
@@ -55,7 +55,7 @@ run_case() {
     local start end
     start=$(date +%s.%N)
     # 本机运行时 mpirun 会把环境变量传给各进程（多节点时 OpenMPI 需加 -x CFD_USE_GPU）
-    (cd "$dir" && CFD_USE_GPU=$useGpu $mpirun_cmd -np "$np" "$exe" > log.txt 2>&1)
+    (cd "$dir" && CFD_USE_GPU=$useGpu CFD_GPU_MIN_ROWS=0 $mpirun_cmd -np "$np" "$exe" > log.txt 2>&1)
     local rc=$?
     end=$(date +%s.%N)
     printf "%-8s np=%-3s exit=%s  time=%ss\n" "$name" "$np" "$rc" "$(awk "BEGIN { printf \"%.2f\", $end - $start }")"

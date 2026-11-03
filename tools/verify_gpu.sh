@@ -7,6 +7,7 @@
 #
 # 流程：编译 gpu_quick_check（三维方腔，只算 5 步）→ 用 CPU 跑一次（CFD_USE_GPU=0）
 #       → 用 GPU 跑一次 →（有 MPI 时）用 2 个进程在 GPU 上再跑一次 → 逐字节比较输出文件。
+# 验证时设置 CFD_GPU_MIN_ROWS=0，使小算例也走 GPU。
 # 全部一致输出 true；否则（或没有用上 GPU、编译/运行失败）输出 false。
 # 详细过程写在 build/verify_gpu/verify.log，出现 false 时可查看原因。
 
@@ -47,9 +48,9 @@ run() {
     ln -s "$root/tempFile" "$dir/tempFile"
     echo "== run $1" >> "$log"
     if [ "$3" = 0 ]; then
-        (cd "$dir" && CFD_USE_GPU=$2 "$exe" > out.txt 2>&1)
+        (cd "$dir" && CFD_USE_GPU=$2 CFD_GPU_MIN_ROWS=0 "$exe" > out.txt 2>&1)
     else
-        (cd "$dir" && CFD_USE_GPU=$2 ${MPIRUN:-mpirun} -np "$3" "$exe" > out.txt 2>&1)
+        (cd "$dir" && CFD_USE_GPU=$2 CFD_GPU_MIN_ROWS=0 ${MPIRUN:-mpirun} -np "$3" "$exe" > out.txt 2>&1)
     fi
     local rc=$?
     grep -E "^\[GPU\]" "$dir/out.txt" >> "$log"

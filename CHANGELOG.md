@@ -18,6 +18,11 @@
 - `tools/compare_gpu.sh` to compare GPU runs with the CPU reference, and
   `tools/verify_gpu.sh` (prints only true/false) with the 5-step `gpu_quick_check` example.
 - `par::HaloExchange::startPacked()/finishPacked()` and `par::nodeLocalRank()`.
+- `CFD_GPU_MIN_ROWS` (default 20000): systems with fewer global rows are solved on the CPU
+  even when a GPU is present, since per-iteration launch/sync overhead makes the GPU
+  slower on small matrices (measured on an RTX 3060 under WSL2). The verification scripts set it to 0.
+- Verified on a real GPU (RTX 3060, CUDA 12.6, WSL2): `tools/verify_gpu.sh` prints `true`;
+  the full 2D cavity is byte-identical between CPU and GPU.
 
 ## v0.2.0 - MPI parallel solver
 
