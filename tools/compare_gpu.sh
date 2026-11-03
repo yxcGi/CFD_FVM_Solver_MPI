@@ -58,7 +58,7 @@ run_case() {
     (cd "$dir" && CFD_USE_GPU=$useGpu $mpirun_cmd -np "$np" "$exe" > log.txt 2>&1)
     local rc=$?
     end=$(date +%s.%N)
-    printf "%-8s np=%-3s exit=%s  time=%.2fs\n" "$name" "$np" "$rc" "$(echo "$end - $start" | bc)"
+    printf "%-8s np=%-3s exit=%s  time=%ss\n" "$name" "$np" "$rc" "$(awk "BEGIN { printf \"%.2f\", $end - $start }")"
     grep -E "^\[GPU\]" "$dir/log.txt" | sed 's/^/    /'
     return $rc
 }
