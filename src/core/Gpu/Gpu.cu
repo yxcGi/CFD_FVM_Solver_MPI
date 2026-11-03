@@ -284,7 +284,10 @@ namespace gpu
         DeviceBuffer<int> sendIdx, recvIdx, interiorRows, haloRows;
         DeviceBuffer<double> sendBuf, recvBuf, blockMax;
 
-        std::vector<double> hostBlockMax;
+        // 块最大值的主机端缓冲区：固定（页锁定）内存，使 D2H 拷贝真正异步，
+        // launchResidual() 才能与 MPI halo 交换重叠
+        double* hostBlockMax = nullptr;
+        int hostBlockCapacity = 0;
         int pendingBlocks = 0;
     };
 
@@ -309,6 +312,10 @@ namespace gpu
         {
             cudaStreamSynchronize(impl_->stream);
             cudaStreamDestroy(impl_->stream);
+        }
+        if (impl_ && impl_->hostBlockMax != nullptr)
+        {
+            cudaFreeHost(impl_->hostBlockMax);
         }
     }
 
@@ -455,7 +462,18 @@ namespace gpu
             return;
         }
         m.blockMax.resize(m.pendingBlocks);
-        m.hostBlockMax.resize(m.pendingBlocks);
+        if (m.pendingBlocks > m.hostBlockCapacity)
+        {
+            if (m.hostBlockMax != nullptr)
+            {
+                check(cudaFreeHost(m.hostBlockMax), "cudaFreeHost");
+                m.hostBlockMax = nullptr;
+                m.hostBlockCapacity = 0;
+            }
+            check(cudaMallocHost(reinterpret_cast<void**>(&m.hostBlockMax), m.pendingBlocks * sizeof(double)),
+                  "cudaMallocHost");
+            m.hostBlockCapacity = m.pendingBlocks;
+        }
 #define CFD_LAUNCH_RESIDUAL(NC, SPLIT) \
         residualMax<NC, SPLIT><<<m.pendingBlocks, BLOCK, 0, m.stream>>>(static_cast<int>(n), rows, \
             m.rowPtr.get(), m.colIdx.get(), m.values.get(), m.b.get(), m.x.get(), m.blockMax.get())
@@ -469,7 +487,7 @@ namespace gpu
         }
 #undef CFD_LAUNCH_RESIDUAL
         check(cudaGetLastError(), "residualMax");
-        check(cudaMemcpyAsync(m.hostBlockMax.data(), m.blockMax.get(), m.pendingBlocks * sizeof(double),
+        check(cudaMemcpyAsync(m.hostBlockMax, m.blockMax.get(), m.pendingBlocks * sizeof(double),
                               cudaMemcpyDeviceToHost, m.stream), "residual D2H");
     }
 

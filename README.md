@@ -862,7 +862,7 @@ CFD_FVM_Solver
 - CMake 3.15 或更新版本；
 - C++20；
 - MPI（OpenMPI / MPICH / Intel MPI 均可，可选）；
-- CUDA Toolkit 11.x / 12.x 与 NVIDIA 显卡（可选，用于 GPU 并行）。
+- CUDA Toolkit 11.x / 12.x / 13.x 与 NVIDIA 显卡（可选，用于 GPU 并行）。
 
 Ubuntu 上安装 OpenMPI：
 
@@ -905,7 +905,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCFD_USE_MPI=OFF
 ```
 
 CMake 默认也会查找 CUDA 编译器（nvcc）：找到时编译 GPU 版本（`CUDA found: ... (GPU build ...)`），找不到时只编译 CPU 版本。
-默认为 sm_70、75、80、86、89、90 生成代码，可只编译自己显卡的架构以加快编译，例如 RTX 3090（sm_86）：
+默认按 nvcc 版本选择架构：CUDA 13 为 sm_75、80、86、89、90、120（CUDA 13 不再支持 sm_70），CUDA 12.8 起为 sm_70 到 120，
+更早版本为 sm_70 到 90。可只编译自己显卡的架构以加快编译，例如 RTX 3090（sm_86）：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
@@ -1417,7 +1418,8 @@ tools/compare_parallel.sh simple_pitz_daily_steady 2 4
    迭代次数多、每次都要遍历整个矩阵，是主要的计算量。GPU 版本把整个迭代放在显存中：
    矩阵每次求解只上传一次，迭代过程中只有幽灵单元的值经主机做 MPI 交换，残差只回传每个线程块的最大值。
 3. **通信与计算重叠**：与 CPU 版本相同，发起 halo 交换后先在 GPU 上计算内部行的残差，
-   交换完成后再计算边界行的残差。
+   交换完成后再计算边界行的残差（残差的块最大值经固定内存异步回传，内核与 MPI 通信真正并行）。
+   CUDA 流与显存缓冲区跨线性求解复用，每次求解只上传矩阵、右端项与初值。
 4. **CPU 回退**：未用 CUDA 编译、运行时找不到 GPU、或设置 `CFD_USE_GPU=0` 时使用原来的 CPU 实现。
 
 ### 如何保证与 CPU 结果逐位一致

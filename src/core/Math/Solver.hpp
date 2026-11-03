@@ -24,7 +24,8 @@
  *    最大残差通过 Allreduce 取全局最大值。由于 Jacobi 每行的更新只依赖上一步的解，
  *    且每行的列顺序与串行相同，并行结果与串行结果逐位一致。
  *  - GPU 并行：编译时启用 CUDA 且运行时检测到 GPU 时，Jacobi 迭代在 GPU 上进行
- *    （矩阵每次求解上传一次，迭代全程留在显存中，只有幽灵单元数据经主机做 MPI 交换）。
+ *    （矩阵每次求解上传一次，迭代全程留在显存中，只有幽灵单元数据经主机做 MPI 交换；
+ *    CUDA 流与显存缓冲区跨求解复用）。
  *    GPU 内核按与 CPU 相同的顺序计算每一行，结果与 CPU 逐位一致。
  *    环境变量 CFD_USE_GPU=0 可强制使用 CPU。
  *  - 线程池并行：setParallel() 开启。单进程时与原实现相同；
@@ -709,7 +710,8 @@ inline void Solver<Tp>::JacobiIterateGpu(const std::vector<Scalar>& diag,
         }
     }
 
-    gpu::JacobiGpu device(nc);
+    // 每种未知量类型只创建一次（CUDA 流与显存缓冲区跨线性求解复用，缓冲区按需增长）
+    static gpu::JacobiGpu device(nc);
     device.upload(size, colSize,
                   equation_.getRowPointer(), equation_.getColIndexs(), equation_.getValues(),
                   diag, reinterpret_cast<const double*>(equation_.getB().data()),

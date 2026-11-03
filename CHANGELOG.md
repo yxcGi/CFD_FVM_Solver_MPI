@@ -10,6 +10,9 @@
 - Results are bitwise identical to the CPU version (same per-row summation order,
   shared row kernels in `JacobiRow.h`, `-fmad=false`, IEEE division/sqrt).
 - CMake option `CFD_USE_CUDA` (ON by default; CPU-only build when nvcc is not found).
+  Default architectures follow the nvcc version (CUDA 13 drops sm_70, CUDA 12.8+ adds sm_120).
+- Device buffers and the CUDA stream are reused across linear solves; residual block maxima
+  are returned through pinned host memory so the interior-row residual overlaps the MPI halo exchange.
   Runtime falls back to the CPU when no GPU is present or `CFD_USE_GPU=0`.
 - CMake option `CFD_GPU_EMULATE` (testing only): host emulation of the GPU backend.
 - `tools/compare_gpu.sh` to compare GPU runs with the CPU reference, and
