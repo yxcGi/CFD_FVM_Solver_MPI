@@ -1,5 +1,6 @@
 #include "Parallel.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -29,6 +30,7 @@ namespace par
         int cachedRank = 0;
         int cachedSize = 1;
         int cachedNodeLocalSize = 1;
+        int cachedNodeLocalRank = 0;
 
         void setupProcessInfo()
         {
@@ -39,6 +41,7 @@ namespace par
             MPI_Comm nodeComm;
             MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &nodeComm);
             MPI_Comm_size(nodeComm, &cachedNodeLocalSize);
+            MPI_Comm_rank(nodeComm, &cachedNodeLocalRank);
             MPI_Comm_free(&nodeComm);
 #endif
             if (cachedRank != 0)
@@ -129,6 +132,7 @@ namespace par
     bool isMaster() { return cachedRank == 0; }
     bool isParallel() { return cachedSize > 1; }
     int nodeLocalSize() { return cachedNodeLocalSize; }
+    int nodeLocalRank() { return cachedNodeLocalRank; }
 
     void abort(int errorCode)
     {
@@ -328,6 +332,64 @@ namespace par
         MPI_Waitall(static_cast<int>(2 * neighbours_.size()), req, MPI_STATUSES_IGNORE);
         inFlight_ = false;
 #endif
+    }
+
+    void HaloExchange::startPacked(const std::vector<double>& packed, std::size_t nc) const
+    {
+        if (neighbours_.empty())
+        {
+            return;
+        }
+        if (packed.size() != totalSendCount() * nc)
+        {
+            throw std::invalid_argument("HaloExchange::startPacked: wrong buffer size");
+        }
+        prepareBuffers(nc);
+        std::size_t offset = 0;
+        for (std::size_t n = 0; n < neighbours_.size(); ++n)
+        {
+            std::copy(packed.begin() + offset, packed.begin() + offset + sendBuffers_[n].size(),
+                      sendBuffers_[n].begin());
+            offset += sendBuffers_[n].size();
+        }
+        postCommunication(nc);
+    }
+
+    void HaloExchange::finishPacked(std::vector<double>& packed, std::size_t nc) const
+    {
+        if (neighbours_.empty())
+        {
+            packed.clear();
+            return;
+        }
+        waitCommunication();
+        packed.resize(totalRecvCount() * nc);
+        std::size_t offset = 0;
+        for (std::size_t n = 0; n < neighbours_.size(); ++n)
+        {
+            std::copy(recvBuffers_[n].begin(), recvBuffers_[n].end(), packed.begin() + offset);
+            offset += recvBuffers_[n].size();
+        }
+    }
+
+    std::size_t HaloExchange::totalSendCount() const
+    {
+        std::size_t total = 0;
+        for (const auto& list : sendIndexes_)
+        {
+            total += list.size();
+        }
+        return total;
+    }
+
+    std::size_t HaloExchange::totalRecvCount() const
+    {
+        std::size_t total = 0;
+        for (const auto& list : recvIndexes_)
+        {
+            total += list.size();
+        }
+        return total;
     }
 
     /* ======================== GlobalOrdering ======================== */

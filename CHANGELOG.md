@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.0 - GPU (CUDA) parallel linear solver
+
+### Added
+
+- CUDA backend for the Jacobi linear solver (`src/core/Gpu/`): MPI + GPU, one GPU
+  per process (device = node-local rank % GPUs per node). The matrix is uploaded
+  once per solve; iterations stay on the GPU and only halo values go through MPI.
+- Results are bitwise identical to the CPU version (same per-row summation order,
+  shared row kernels in `JacobiRow.h`, `-fmad=false`, IEEE division/sqrt).
+- CMake option `CFD_USE_CUDA` (ON by default; CPU-only build when nvcc is not found).
+  Default architectures follow the nvcc version (CUDA 13 drops sm_70, CUDA 12.8+ adds sm_120).
+- Device buffers and the CUDA stream are reused across linear solves; residual block maxima
+  are returned through pinned host memory so the interior-row residual overlaps the MPI halo exchange.
+  Runtime falls back to the CPU when no GPU is present or `CFD_USE_GPU=0`.
+- CMake option `CFD_GPU_EMULATE` (testing only): host emulation of the GPU backend.
+- `tools/compare_gpu.sh` to compare GPU runs with the CPU reference, and
+  `tools/verify_gpu.sh` (prints only true/false) with the 5-step `gpu_quick_check` example.
+- `par::HaloExchange::startPacked()/finishPacked()` and `par::nodeLocalRank()`.
+- `CFD_GPU_MIN_ROWS` (default 5000): systems with fewer global rows are solved on the CPU
+  even when a GPU is present, since per-iteration launch/sync overhead makes the GPU
+  slower on small matrices. The verification scripts set it to 0.
+- Verified on a real GPU (RTX 3060, CUDA 12.6, WSL2): `tools/verify_gpu.sh` prints `true`;
+  the full 2D cavity (400 cells) is byte-identical between CPU and GPU but 28x slower on the GPU;
+  the 10250-cell 3D cavity is byte-identical and 2.5x faster on the GPU (5 SIMPLE steps: 38.2 s vs 15.0 s).
+
 ## v0.2.0 - MPI parallel solver
 
 ### Added
